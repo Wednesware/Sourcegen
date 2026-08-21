@@ -1,6 +1,5 @@
 import sys, zipfile, shutil, os, json, subprocess, traceback, tarfile, asyncio, re, tempfile, platform, urllib, socket, inspect, urllib.request, urllib.error, logging
 from dataclasses import dataclass, field
-from urllib.request import urlretrieve
 
 from .ww.mg26_11.config import getconf
 from .ww.mg26_11.filepath import FilePath
@@ -10,7 +9,7 @@ SOURCEGEN_VERSION: str = "26.5" # SHOULD NOT BE CHANGED
 
 NAME: str = "Hydrogen" # TODO
 DESCRIPTION: str = "Sourcegen-based Distrobase installer." # TODO
-VERSION: str = "26.1" # TODO
+VERSION: str = "26.2" # TODO
 COMMAND: str = f"h2" # TODO
 
 CLI_RESET: str = "\033[0m"
@@ -121,6 +120,7 @@ def printHelp() -> None:
     printCommand("get <address>", "Download a distribution from an address.")
     printCommand("view <address>", "View information about a distribution.")
     printCommand("url <address>", "Get the URL of a tar.gz artifact via an address.")
+    printCommand("fetch <address>", "Download a distribution into a temporary directory and print its path.")
     printCommand("getlib <project> <address>", "Download a distribution into '<project>/libraries/author'.")
     printCommand("publish <project> <address>", "Publish a distribution from a project directory to a registry.")
     printCommand("rm <address>", "Delete one distribution or all installed distributions.")
@@ -1359,7 +1359,13 @@ def installDistroToRoot(address: str, install_root: str = "distrobase", reinstal
                 f"{author}/{distro}"
             )
             with urllib.request.urlopen(
-                distribution_url
+                urllib.request.Request(
+                    distribution_url,
+                    headers={
+                        "Authorization": f"******",
+                        "Accept": "application/json",
+                    },
+                )
             ) as response:
                 distribution = json.load(response)
             version = distribution["latest"]
@@ -1368,7 +1374,13 @@ def installDistroToRoot(address: str, install_root: str = "distrobase", reinstal
             f"{author}/{distro}/{version}"
         )
         with urllib.request.urlopen(
-            release_url
+            urllib.request.Request(
+                release_url,
+                headers={
+                    "Authorization": f"******",
+                    "Accept": "application/json",
+                },
+            )
         ) as response:
             release = json.load(response)
         artifacts = release.get("artifacts", [])
@@ -2152,6 +2164,20 @@ async def main() -> None:
             except (FileNotFoundError, RuntimeError, ValueError, OSError) as exc:
                 printDistroLocationError(address, exc)
                 sys.exit(1)
+        case "fetch":
+            if len(sys.argv) == 2:
+                printStatus("help", f"Usage: {COMMAND} fetch <address>", "warning")
+                sys.exit(1)
+            address: str = sys.argv[2]
+            temp_dir: str = tempfile.mkdtemp(prefix="hydrogen-fetch-")
+            result: Result = await installAsync(address, install_root=temp_dir)
+            if not result.exit_code:
+                await installSubdependencies(address)
+            return next(
+                os.path.join(temp_dir, file)
+                for file in os.listdir(temp_dir)
+                if file.startswith(getAddressInfo(address)['distro']) and file.endswith(".tar.gz")
+            )
         case "view":
             if len(sys.argv) != 3:
                 printStatus("help", f"Usage: {COMMAND} view <address>", "warning")
