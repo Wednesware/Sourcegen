@@ -23,4 +23,4 @@ NOTE: This repository is no longer a template repository as GitHub templates do 
 
 ## Important note
 
-* After creating a repository with Sourcegen as a template, open your IDE and press `CTRL+SHIFT+F` (or whatever your IDE's search tab bind is). Search for `# TODO` and one-by-one assess and modify the lines. `# TODO` marks lines that should be changed before the installer is distributed.
+* After creating a repository with Sourcegen as a template, open your IDE and press `CTRL+SHIFT+F` (or whatever your IDE's search tab bind is). Search for `# TODO` and one-by-one assess and modify the lines. `# TODO` marks lines that should be changed before the installer is published.
