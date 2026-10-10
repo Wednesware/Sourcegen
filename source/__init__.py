@@ -1,15 +1,17 @@
-import sys, zipfile, shutil, os, urllib.error, subprocess, traceback, tarfile, asyncio, re
+# Sourcegen template, adapted from Nitrogen 26.66.
+# TODO: Customize NAME/DESCRIPTION/VERSION/COMMAND, alias mapping, and the
+# download and extraction hooks before distributing your installer.
+# The latest Nitrogen's removed staging, extensions, compat and dependency-file
+# commands are intentionally not restored here.
+import sys, zipfile, shutil, os, urllib.error, traceback, asyncio, re, importlib.util, json, threading, pathlib, subprocess
 from dataclasses import dataclass
 from urllib.request import urlretrieve
 
-
-SOURCEGEN_VERSION: str = "26.5" # SHOULD NOT BE CHANGED
-
-NAME: str = "Sourcegen" # TODO
-DESCRIPTION: str = "Enter a short one-line description here." # TODO
-VERSION: str = "26.1" # TODO
-COMMAND: str = f"python -m {os.path.basename(os.path.dirname(__file__))}" # TODO
-
+SOURCEGEN_VERSION: str = "26.66"  # SHOULD NOT BE CHANGED: upstream compatibility baseline
+NAME: str = "Sourcegen"  # TODO: Your installer name
+DESCRIPTION: str = "A customizable software installer."  # TODO: Describe your installer in one short line.
+VERSION: str = "0.1.0"  # TODO: Your installer's own release version
+COMMAND: str = f"python -m {os.path.basename(os.path.dirname(__file__))}"  # TODO: Your CLI invocation
 CLI_RESET: str = "\033[0m"
 CLI_BOLD: str = "\033[1m"
 CLI_DIM: str = "\033[90m"
@@ -17,64 +19,393 @@ CLI_INFO: str = "\033[94m"
 CLI_SUCCESS: str = "\033[92m"
 CLI_WARNING: str = "\033[93m"
 CLI_ERROR: str = "\033[91m"
-
-PUBLICATION_CACHE: dict[str, str] = {
-    "n": "nitrogen",
-    "mg": "magnesium",
-    "he": "helium",
-    "na": "sodium",
-    "kr": "krypton",
-    "o": "oxygen",
-    "li": "lithium",
-    "h": "hydrogen",
-    "i": "iodine",
-    "in": "indium",
-    "ne": "neon",
-    "c": "carbon",
-    "b": "boron",
-    "f": "fluorine",
-    "s": "sulfur",
-    "p": "phosphorus",
-    "cl": "chlorine",
-    "ar": "argon",
-    "k": "potassium",
-    "ca": "calcium",
-    "sc": "scandium",
-    "ti": "titanium",
-    "v": "vanadium",
-    "cr": "chromium",
-    "mn": "manganese",
-    "fe": "iron",
-    "co": "cobalt",
-    "ni": "nickel",
-    "cu": "copper",
-    "zn": "zinc",
-    "ga": "gallium",
-    "ge": "germanium",
-    "as": "arsenic",
-    "se": "selenium",
-    "br": "bromine",
-    "rb": "rubidium",
-    "sr": "strontium",
-    "y": "yttrium",
-    "zr": "zirconium",
-    "nb": "niobium",
-    "mo": "molybdenum",
-    "tc": "technetium",
-    "ru": "ruthenium",
-    "rh": "rhodium",
-    "pd": "palladium"
-}
+# TODO: Optional aliases for the packages YOUR installer supports (alias -> canonical name).
+# Leave empty to allow any name, or populate it to restrict commands to a catalog.
+PUBLICATION_CACHE: dict[str, str] = {}  # TODO: Add optional shortcuts
 REVERSE_PUBLICATION_CACHE: dict[str, str] = {v: k for k, v in PUBLICATION_CACHE.items()}
-EXTENSIONS_DIR: str = os.path.join(os.path.dirname(__file__), "extensions")
-TRUSTED_EXTENSIONS_FILE: str = os.path.join(os.path.dirname(__file__), ".TRUSTED_EXTENSIONS")
-LEN_PATH: str = os.path.join(os.path.dirname(__file__), "ww", "len")
-NITROSTAGED_FILE: str = ".nitrostaged"
-# "internal" installs live inside the nitrogen package itself (not the cwd), so commands like
-INTERNAL_WW_DIR: str = os.path.join(os.path.dirname(__file__), "ww")
-INTERNAL_TEMP_DIR: str = os.path.join(INTERNAL_WW_DIR, "temp")
+# Internal installs live inside this installer package rather than the working directory.
+INTERNAL_PACKAGES_DIR: str = os.path.join(os.path.dirname(__file__), "packages")
+INTERNAL_TEMP_DIR: str = os.path.join(os.path.dirname(__file__), "temp")
+
+# TODO: Specify your own package's PyPI distribution name if installed applications
+# must depend on your installer. None disables injecting such a dependency.
+INSTALLER_PACKAGE_DEPENDENCY: str | None = None
+# TODO: Define how a package and release are obtained. This is deliberately
+# NOT wired to Nitrogen/GitHub/Wednesware. Override these two functions.
+def resolve_download_url(package: str, release: str) -> str:
+    """Return a direct URL to a ZIP archive for the requested package/release."""
+    # TODO: Replace with your registry, CDN, GitHub releases, etc.
+    # Example: return f"https://example.org/{package}/{release}.zip"
+    raise NotImplementedError("TODO: implement resolve_download_url() for your installer")
+
+def resolve_extracted_source(extract_root: str, package: str, release: str) -> str:
+    """Return the directory to cache after archive extraction."""
+    # TODO: Set your archive layout here. By default a single top-level
+    # folder is used; if there are multiple entries, cache the entire archive.
+    entries = os.listdir(extract_root)
+    if len(entries) == 1 and os.path.isdir(os.path.join(extract_root, entries[0])):
+        return os.path.join(extract_root, entries[0])
+    return extract_root
+
+# TODO (optional): Override the entire install flow (git clone, pip, API, etc.).
+# Return an InstallResult to bypass the default ZIP downloader, or None to use it.
+# Place installed files under os.path.join(install_root, _publication_leaf(package, release)).
+def custom_install_package(package: str, release: str, install_root: str, work_dir: str) -> "InstallResult | None":
+    return None  # TODO: replace with your own installer if ZIP downloads do not fit
 
 running_installs: dict[tuple[str, str, str], asyncio.Task] = {}
+
+def _read_raw_sourcepkg(path: str) -> dict:
+    pkg_dir = os.path.abspath(path)
+    if not os.path.isdir(pkg_dir):
+        raise ValueError(f"Only directories can be installed: {path}")
+    pkg_file = os.path.join(pkg_dir, ".sourcepkg")
+    if not os.path.isfile(pkg_file):
+        raise ValueError(f"Only package directories with a JSON .sourcepkg file can be installed: {path}")
+    try:
+        with open(pkg_file, "r", encoding="utf-8") as handle:
+            metadata = json.load(handle)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f".sourcepkg is not valid JSON: {pkg_file}") from exc
+    if not isinstance(metadata, dict):
+        raise ValueError(f".sourcepkg must contain a JSON object: {pkg_file}")
+    return dict(metadata)
+
+def _load_sourcepkg(path: str) -> dict:
+    metadata = _read_raw_sourcepkg(path)
+    metadata.pop("dependency", None)
+    metadata.pop("name", None)
+    metadata.pop("command", None)
+    return metadata
+
+def _resolve_sourcepkg_entry(path: str, metadata: dict) -> str:
+    entry = metadata.get("entry") or metadata.get("main") or metadata.get("script")
+    if entry:
+        target = os.path.join(path, entry)
+        if os.path.isfile(target):
+            return target
+    for candidate in ("__main__.py", "main.py", "app.py", "run.py"):
+        target = os.path.join(path, candidate)
+        if os.path.isfile(target):
+            return target
+    raise ValueError(f"No valid entry script found in package directory '{path}'")
+
+def _as_path_list(root: str) -> list[str]:
+    root_abs = os.path.abspath(root)
+    parent_abs = os.path.dirname(root_abs)
+    entries: list[str] = []
+    for candidate in (parent_abs, root_abs):
+        if candidate and candidate not in entries:
+            entries.append(candidate)
+    for relative in ("packages", "libraries", os.path.join("libraries", "packages")):
+        candidate = os.path.join(root_abs, relative)
+        if os.path.isdir(candidate) and candidate not in entries:
+            entries.append(candidate)
+    for relative in ("packages", "libraries", os.path.join("libraries", "packages")):
+        candidate = os.path.join(parent_abs, relative)
+        if os.path.isdir(candidate) and candidate not in entries:
+            entries.append(candidate)
+    return entries
+
+def _module_name_from_root(root: str) -> str | None:
+    package_init = os.path.join(root, "__init__.py")
+    if os.path.isfile(package_init):
+        package_name = os.path.basename(root)
+        normalized = package_name.replace("-", "_").replace(".", "_")
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", normalized):
+            return normalized
+    return None
+
+def _sanitize_python_name(value: str) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9_.-]+", "-", value.strip())
+    sanitized = sanitized.strip("-_.")
+    return sanitized or "sourcegen-app"
+
+def _toml_list(values: object) -> str:
+    if values is None:
+        return "[]"
+    if isinstance(values, str):
+        values = [values]
+    normalized = [str(item).strip() for item in values if str(item).strip()]
+    if not normalized:
+        return "[]"
+    return ", ".join(json.dumps(item) for item in normalized)
+
+def _dependency_list(values: object | None, *, include_installer: bool = False) -> list[str]:
+    if values is None:
+        values = []
+    if isinstance(values, str):
+        values = [values]
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        candidate = str(item).strip()
+        if not candidate:
+            continue
+        key = candidate.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(candidate)
+    if include_installer and INSTALLER_PACKAGE_DEPENDENCY:
+        nitro_key = INSTALLER_PACKAGE_DEPENDENCY
+        if not any(item.lower() == nitro_key for item in normalized):
+            normalized.insert(0, nitro_key)
+    return normalized
+
+def _build_entry_wrapper(entry: str, pkg_dir: str) -> str:
+    entry_value = entry.replace("\\", "/")
+    pkg_root = os.path.abspath(pkg_dir)
+    package_name = os.path.basename(pkg_root).replace("-", "_").replace(".", "_") or "sourcegen_app"
+    module_path = os.path.join(pkg_root, "__main__.py") if os.path.isfile(os.path.join(pkg_root, "__main__.py")) else os.path.join(pkg_root, "main.py")
+    wrapper = f"""
+import os
+import runpy
+import sys
+
+ROOT = {pkg_root!r}
+ENTRY = {entry_value!r}
+PACKAGE_NAME = {package_name!r}
+MODULE_PATH = {module_path!r}
+
+def main() -> None:
+    entry_path = os.path.join(ROOT, ENTRY)
+    if os.path.isfile(entry_path):
+        if os.path.basename(entry_path) == "__main__.py" and os.path.isfile(os.path.join(ROOT, "__init__.py")):
+            sys.path.insert(0, os.path.dirname(ROOT))
+            runpy.run_module(PACKAGE_NAME, run_name="__main__")
+            return
+        runpy.run_path(entry_path, run_name="__main__")
+        return
+    if os.path.isfile(MODULE_PATH):
+        sys.path.insert(0, os.path.dirname(ROOT))
+        runpy.run_module(PACKAGE_NAME, run_name="__main__")
+        return
+    raise FileNotFoundError(f"No entry script found for package at {{ROOT!r}}")
+"""
+    return wrapper
+
+def _infer_package_metadata(pkg_dir: str, cmd_name: str | None = None, entry: str | None = None) -> dict:
+    pkg_name = os.path.basename(os.path.abspath(pkg_dir)) or "sourcegen-app"
+    resolved_entry = entry or next((candidate for candidate in ("__main__.py", "main.py", "app.py", "run.py") if os.path.isfile(os.path.join(pkg_dir, candidate))), None)
+    return {
+        "name": cmd_name or pkg_name,
+        "command": cmd_name or pkg_name,
+        "entry": resolved_entry,
+        "version": "0.1.0",
+        "description": f"Package {pkg_name}",
+        "requires-python": ">=3.12",
+    }
+
+def _resolve_cached_publication_entry(publication_dir: str, subpath: str | None = None) -> str:
+    if subpath:
+        cleaned = subpath.replace("\\", "/").strip("/")
+        if cleaned.endswith(".py"):
+            candidate = os.path.join(publication_dir, *cleaned.split("/"))
+            if os.path.isfile(candidate):
+                return candidate
+        pieces = [part for part in cleaned.split("/") if part]
+        if pieces:
+            candidate = os.path.join(publication_dir, *pieces)
+            if os.path.isfile(candidate):
+                return candidate
+            package_candidate = os.path.join(candidate, "__main__.py")
+            if os.path.isfile(package_candidate):
+                return package_candidate
+            file_candidate = candidate + ".py"
+            if os.path.isfile(file_candidate):
+                return file_candidate
+    candidates = [
+        os.path.join(publication_dir, "__main__.py"),
+        os.path.join(publication_dir, "main.py"),
+        os.path.join(publication_dir, "app.py"),
+        os.path.join(publication_dir, "run.py"),
+    ]
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    raise ValueError(f"No executable entry point was found in cached publication '{publication_dir}'.")
+
+def _write_pyproject_toml(pkg_dir: str, cmd_name: str, metadata: dict | None = None) -> str:
+    metadata = dict(metadata or _infer_package_metadata(pkg_dir, cmd_name))
+    package_name = metadata.get("package_name") or metadata.get("publication") or metadata.get("name") or cmd_name or os.path.basename(pkg_dir)
+    project_name = _sanitize_python_name(package_name)
+    entry = metadata.get("entry") or metadata.get("main") or metadata.get("script") or next((candidate for candidate in ("__main__.py", "main.py", "app.py", "run.py") if os.path.isfile(os.path.join(pkg_dir, candidate))), None)
+    if entry is None:
+        raise ValueError(f"No valid entry script found in package directory '{pkg_dir}'")
+    package_dir = os.path.abspath(pkg_dir)
+    projected_root = os.path.basename(package_dir) or "sourcegen-app"
+    projected_name = _sanitize_python_name(projected_root)
+    dependency_entries = metadata.get("dependencies") or []
+    dependencies_line = f"dependencies = [{_toml_list(dependency_entries)}]\n" if dependency_entries else ""
+    wrapper_path = os.path.join(package_dir, "sourcegen_entry.py")
+    with open(wrapper_path, "w", encoding="utf-8") as handle:
+        handle.write(_build_entry_wrapper(entry, package_dir))
+
+    pyproject_path = os.path.join(package_dir, "pyproject.toml")
+    with open(pyproject_path, "w", encoding="utf-8") as handle:
+        handle.write(
+            "[build-system]\n"
+            "requires = [\"setuptools>=68\"]\n"
+            "build-backend = \"setuptools.build_meta\"\n\n"
+            "[project]\n"
+            f"name = \"{project_name}\"\n"
+            f"version = \"{metadata.get('version', '0.1.0')}\"\n"
+            f"description = \"{metadata.get('description', metadata.get('name', projected_name))}\"\n"
+            f"requires-python = \"{metadata.get('requires-python', '>=3.12')}\"\n"
+            + (dependencies_line + "\n" if dependencies_line else "") +
+            "\n[project.scripts]\n"
+            f"{cmd_name} = \"sourcegen_entry:main\"\n\n"
+            "[tool.setuptools]\n"
+            "py-modules = [\"sourcegen_entry\"]\n"
+        )
+    return pyproject_path
+
+def _install_via_pipx(pkg_dir: str, command_name: str | None = None, metadata: dict | None = None) -> dict:
+    if shutil.which("pipx") is None:
+        raise RuntimeError("pipx is not installed or not on PATH")
+
+    if metadata is None:
+        metadata = _load_sourcepkg(pkg_dir) if os.path.isfile(os.path.join(pkg_dir, ".sourcepkg")) else _infer_package_metadata(pkg_dir, command_name)
+    else:
+        metadata = dict(metadata)
+
+    resolved_name = command_name or metadata.get("command") or metadata.get("name") or os.path.basename(pkg_dir)
+    metadata["command"] = resolved_name
+    metadata["name"] = resolved_name
+    pyproject_path = _write_pyproject_toml(pkg_dir, resolved_name, metadata)
+    env = os.environ.copy()
+    try:
+        subprocess.run(["pipx", "uninstall", resolved_name], capture_output=True, text=True, env=env, check=False)
+        install_result = subprocess.run(["pipx", "install", pkg_dir, "--force"], capture_output=True, text=True, env=env, check=False)
+        if install_result.returncode != 0:
+            output = (install_result.stderr or install_result.stdout or "").strip()
+            lowered = output.lower()
+            if any(token in lowered for token in ("already installed", "already exists", "already installed in pipx", "use 'pipx reinstall")):
+                reinstall_result = subprocess.run(["pipx", "reinstall", resolved_name], capture_output=True, text=True, env=env, check=False)
+                if reinstall_result.returncode != 0:
+                    reinstall_output = (reinstall_result.stderr or reinstall_result.stdout or "").strip()
+                    lowered = reinstall_output.lower()
+                    if "nothing to reinstall" in lowered or "not installed" in lowered or "no app" in lowered:
+                        return {
+                            "command_name": resolved_name,
+                            "source_path": pkg_dir,
+                            "root": pkg_dir,
+                            "target": os.path.join(pkg_dir, metadata.get("entry") or "__main__.py"),
+                            "metadata": metadata,
+                        }
+                    if not reinstall_output:
+                        reinstall_output = f"pipx exited with status {reinstall_result.returncode} while reinstalling '{resolved_name}'."
+                    raise RuntimeError(
+                        f"Could not reinstall '{resolved_name}' via pipx. pipx reported: {reinstall_output}"
+                    )
+                return {
+                    "command_name": resolved_name,
+                    "source_path": pkg_dir,
+                    "root": pkg_dir,
+                    "target": os.path.join(pkg_dir, metadata.get("entry") or "__main__.py"),
+                    "metadata": metadata,
+                }
+            if not output:
+                output = f"pipx exited with status {install_result.returncode} while installing '{resolved_name}'."
+            raise RuntimeError(f"Could not install '{resolved_name}' via pipx. pipx reported: {output}")
+    finally:
+        for cleanup_path in (pyproject_path, os.path.join(pkg_dir, "sourcegen_entry.py")):
+            if os.path.exists(cleanup_path):
+                os.remove(cleanup_path)
+
+    if os.path.isfile(os.path.join(pkg_dir, ".sourcepkg")):
+        target = _resolve_sourcepkg_entry(pkg_dir, metadata)
+    else:
+        entry_name = metadata.get("entry") or metadata.get("main") or metadata.get("script")
+        fallback = "__main__.py" if os.path.isfile(os.path.join(pkg_dir, "__main__.py")) else "main.py"
+        target = os.path.join(pkg_dir, entry_name or fallback)
+
+    return {
+        "command_name": resolved_name,
+        "source_path": pkg_dir,
+        "root": pkg_dir,
+        "target": target,
+        "metadata": metadata,
+    }
+
+async def install_target(path: str, command_name: str | None = None, no_deps: bool = False) -> dict:
+    pkg_dir = os.path.abspath(path)
+    install_root = os.path.abspath(INTERNAL_PACKAGES_DIR)
+    try:
+        common_root = os.path.commonpath([install_root, pkg_dir])
+    except ValueError:
+        common_root = ""
+    if common_root != install_root:
+        raise ValueError(
+            "Only cached installer-managed directories may be installed via pipx. "
+            "Direct local package installs are disabled by default."
+        )
+
+    publication_dir_name = os.path.basename(pkg_dir)
+    parsed = _parse_installed_publication_dir(publication_dir_name)
+    if parsed is None:
+        raise ValueError(
+            "Only cached installer-managed directories may be installed via pipx. "
+            "Direct local package installs are disabled by default."
+        )
+
+    publication_name, release = parsed
+    return install_cached_publication(publication_name, release, command_name=command_name)
+
+def install_cached_publication(pub: str, rel: str = "latest", *, command_name: str | None = None, cache_root: str | None = None) -> dict:
+    publication_target = pub.strip().strip("/")
+    subpath: str | None = None
+    if "/" in publication_target:
+        publication_name, subpath = publication_target.split("/", 1)
+    else:
+        publication_name = publication_target
+
+    resolved_pub = parsepub(publication_name)
+    target_root = cache_root or INTERNAL_PACKAGES_DIR
+    publication_dir = os.path.join(target_root, _publication_leaf(resolved_pub, rel))
+    if not os.path.isdir(publication_dir):
+        raise FileNotFoundError(f"Publication '{resolved_pub}' release '{rel}' is not installed in the internal cache at '{publication_dir}'.")
+
+    entry_target = _resolve_cached_publication_entry(publication_dir, subpath)
+    relative_entry = os.path.relpath(entry_target, publication_dir).replace(os.sep, "/")
+    raw_sourcepkg = _read_raw_sourcepkg(publication_dir) if os.path.isfile(os.path.join(publication_dir, ".sourcepkg")) else {}
+    sourcepkg_metadata = _load_sourcepkg(publication_dir) if os.path.isfile(os.path.join(publication_dir, ".sourcepkg")) else {}
+    publication_command_name = command_name or raw_sourcepkg.get("command") or raw_sourcepkg.get("name") or sourcepkg_metadata.get("command") or sourcepkg_metadata.get("name") or resolved_pub.lower()
+    metadata = _infer_package_metadata(publication_dir, publication_command_name, entry=relative_entry)
+    metadata.update(sourcepkg_metadata)
+    metadata["command"] = publication_command_name
+    metadata["name"] = publication_command_name
+    metadata["package_name"] = resolved_pub.lower()
+    metadata["publication"] = resolved_pub
+    metadata["dependencies"] = _dependency_list(metadata.get("dependencies"), include_installer=bool(INSTALLER_PACKAGE_DEPENDENCY))
+    result = _install_via_pipx(publication_dir, publication_command_name, metadata=metadata)
+    result["publication"] = resolved_pub
+    result["release"] = rel
+    result["entry_path"] = relative_entry
+    return result
+
+def uninstall_target(command_name: str) -> dict:
+    requested_name = (command_name or "").strip()
+    package_name = parsepub(requested_name)
+    if shutil.which("pipx") is None:
+        raise RuntimeError("pipx is not installed or not on PATH.")
+
+    result = subprocess.run(["pipx", "uninstall", package_name], capture_output=True, text=True)
+    if result.returncode == 0:
+        return {
+            "command_name": requested_name,
+            "package_name": package_name,
+            "removed": True,
+            "path": None,
+        }
+
+    output = (result.stderr or result.stdout or "").strip()
+    if not output:
+        output = f"The package '{package_name}' is not installed or could not be removed."
+    if any(token in output.lower() for token in ("not installed", "not found", "no app")):
+        raise RuntimeError(f"The command '{requested_name}' is not installed in pipx, so there was nothing to remove.")
+    raise RuntimeError(f"The package '{package_name}' could not be removed. pipx reported: {output}")
 
 @dataclass(slots=True)
 class InstallResult:
@@ -82,11 +413,9 @@ class InstallResult:
     lines: list[str]
     exit_code: int = 0
 
-
 def _cli(text: str, color: str = "", bold: bool = False) -> str:
     prefix: str = f"{CLI_BOLD if bold else ''}{color}"
     return f"{prefix}{text}{CLI_RESET if prefix else ''}"
-
 
 def _print_status(label: str, message: str, tone: str = "info") -> None:
     palette: dict[str, str] = {
@@ -99,10 +428,8 @@ def _print_status(label: str, message: str, tone: str = "info") -> None:
     color: str = palette.get(tone, "")
     print(f"{_cli(f'[{label}]', color, bold=True)} {message}")
 
-
 def _print_section(title: str) -> None:
     print(_cli(title, CLI_BOLD))
-
 
 def _print_command(signature: str, description: str) -> None:
     print(f"  {_cli(signature, CLI_INFO)} {_cli('-', CLI_DIM)} {description}")
@@ -115,122 +442,39 @@ def _print_help() -> None:
     print(f"  {COMMAND} <command> [args]")
     print()
     _print_section("General")
-    _print_command("get <publication> [release]", "Download a Wednesware publication from GitHub.")
-    _print_command("getlib <project> <publication> [release]", "Download a Wednesware publication into '<project>/libraries/ww'.")
+    _print_command("get <publication> [release]", "Download a package using the configured source.")
     _print_command("rm <publication> [release]", "Delete one release or all installed releases for a publication.")
-    _print_command("getdep [path]", "Install missing dependencies from a .nitrodep file, including nested ones.")
-    _print_command("forcegetdep [path]", "Install all dependencies, regardless of whether they are already installed from a .nitrodep file, including nested ones, forcing reinstallation of all dependencies.")
-    _print_command("updlibs <project>", "Reinstall all libraries in '<project>/libraries/ww' from their exact installed versions.")
-    _print_command("getinternal <publication> [release]", "Same as `get` into `nitrogen/ww` instead of './ww'.")
-    _print_command("rminternal <publication> [release]", "Same as `rm` but for `nitrogen/ww`.")
-    _print_command("getdepinternal [path]", "Same as `getdep` but for `nitrogen/ww` instead of './ww'.")
-    print()
-    _print_section("Compatibility")
-    _print_command("compat <mode> <publication|directory> [custom-phrase]", "Rewrite Wednesware imports in a directory to match the specified compatibility mode.")
-    _print_command("compat abs <publication|directory>", "Use 'abs' for packages found in '.'. ")
-    _print_command("compat rel <publication|directory>", "Use 'rel' for packages found in '<project>'.")
-    _print_command("compat rel-up1 <publication|directory>", "Use 'rel-up1' for packages found in '<project>/../'.")
-    _print_command("compat rel-up2 <publication|directory>", "Use 'rel-up2' for packages found in '<project>/../../'.")
-    _print_command("compat rel-up3 <publication|directory>", "Use 'rel-up3' for packages found in '<project>/../../../'.")
-    _print_command("compat abs-ww <publication|directory>", "Use 'abs-ww' for packages found in './ww'. Default compat mode.")
-    _print_command("compat rel-ww <publication|directory>", "Use 'rel-ww' for packages found in '<project>/ww' with relative imports.")
-    _print_command("compat rel-libs-ww <publication|directory>", "Use 'rel-libs-ww' for Helium projects or packages found in '<project>/libraries/ww' with relative imports.")
-    _print_command("compat custom <publication|directory> <custom-phrase>", "Use 'custom' to specify a custom phrase for the import prefix.")
-    print()
-    _print_section("Stage")
-    _print_command("stage get <publication> [release]", "Stage a dependency install into ./ww.")
-    _print_command("stage getlib <project> <publication> [release]", "Stage a library install into ./<project>/libraries/ww.")
-    _print_command("stage adddep <publication> [release]", "Stage adding one dependency line to ./.nitrodep.")
-    _print_command("stage rmdep <publication> [release]", "Stage removing one dependency line from ./.nitrodep.")
-    _print_command("stage getdep [target]", "Stage running getdep at ./<target>.")
-    _print_command("stage forcegetdep [target]", "Stage running forcegetdep at ./<target>.")
-    _print_command("stage updlibs [target]", "Stage running updlibs at ./<target>.")
-    _print_command("stage rm <publication> [release]", "Stage dependency removal from ./ww.")
-    _print_command("stage rmlib <project> <publication> [release]", "Stage library removal from ./<project>/libraries/ww.")
-    _print_command("stage compat <mode> <publication|directory> [custom-phrase]", "Stage compatibility rewrite for Wednesware imports in a directory.")
-    _print_command("stage cmd <command>", "Stage a shell command to run during stage execute/commit.")
-    _print_command("stage getinternal <publication> [release]", "Stage a dependency install into nitrogen/ww.")
-    _print_command("stage rminternal <publication> [release]", "Stage dependency removal from nitrogen/ww.")
-    _print_command("stage getdepinternal [target]", "Stage running getdep against nitrogen/ww at ./<target>.")
-    _print_command("stage cancel [subcommand|last] [args]", "Cancel one staged line, the last line, or the full stage.")
-    _print_command("stage execute", "Execute staged actions in exact order.")
-    _print_command("stage commit", "Execute staged installs/removals in batched mode.")
-    print()
-    _print_section("Build")
-    _print_command("build zip [source path(. by default)] [output path(build.zip by default)]", "Build the current Nitrogen project into a zip archive.")
-    _print_command("build targz [source path(. by default)] [output path(build.tar.gz by default)]", "Build the current Nitrogen project into a tar.gz archive.")
-    _print_command("build n2x [source path(. by default)] [output path(build.n2x by default)]", "Build a Nitrogen extension archive from the required extension files.")
+    _print_command("install <publication> [release]", "Install a cached package via pipx.")
+    _print_command("uninstall <publication> [release]", "Uninstall an installed package by its publication name and optional release from the pipx cache.")
+    _print_command("list", "List installed publications in the installer's internal cache.")
+    _print_command("cache", "Show the total cache size and per-publication cache usage.")
     print()
     _print_section("Documentation")
-    _print_command("readme [extension]", "Show the README for Nitrogen or an installed extension.")
-    _print_command("license [extension]", "Show the license for Nitrogen or an installed extension.")
+    _print_command("readme", "Show the installer README.")
+    _print_command("license", "Show the installer license.")
     _print_command("help", "Show this help message.")
-    print()
-    _print_section("Extensions")
-    _print_command("list-ext", "List installed extensions and their local paths.")
-    _print_command("trust-ext <extension>", "Trust an extension so it can run without confirmation.")
-    _print_command("untrust-ext <extension>", "Remove trust for an extension.")
-    _print_command("install-ext <extension>", "Install an extension from LEN.")
-    _print_command("uninstall-ext <extension>", "Remove an installed extension.")
-    _print_command("list-len", "List available extensions in LEN.")
-    _print_command("load-len", "Clone the LEN repository locally.")
-    _print_command("unload-len", "Remove the local LEN checkout.")
-
-def _print_installed_extensions() -> None:
-    _print_section("Installed extensions")
-    sent: bool = False
-    for ext_filename in [item for item in os.listdir(EXTENSIONS_DIR) if item.endswith(".n2x")]:
-        print(f"  {_cli(ext_filename, CLI_INFO)} {_cli('->', CLI_DIM)} {os.path.join(EXTENSIONS_DIR, ext_filename)}")
-        sent = True
-    if not sent:
-        _print_status("empty", "No extensions were detected.", "warning")
-
-
-def _print_len_extensions() -> None:
-    _print_section("Available extensions")
-    printed: bool = False
-    for ext_filename in [item for item in os.listdir(LEN_PATH) if item.endswith(".n2x")]:
-        print(f"  {_cli(ext_filename, CLI_INFO)} {_cli('->', CLI_DIM)} https://github.com/Wednesware/LEN/blob/main/{ext_filename}")
-        printed = True
-    if not printed:
-        _print_status("empty", "No extensions were detected in the LEN repository.", "warning")
-
-
-def _print_extension_commands() -> None:
-    _print_section("Custom commands")
-    printed: bool = False
-    for ext_path in [item for item in os.listdir(EXTENSIONS_DIR) if item.endswith(".n2x")]:
-        print(f"  {_cli(ext_path.removesuffix('.n2x'), CLI_INFO)} {_cli('-', CLI_DIM)} Provided by '{ext_path}' at '{os.path.join(EXTENSIONS_DIR, ext_path)}'")
-        printed = True
-    if not printed:
-        print(f"  {_cli('(none installed)', CLI_DIM)}")
 
 def parsepub(pub: str) -> str:
-    if pub.lower() in PUBLICATION_CACHE:
-        return PUBLICATION_CACHE[pub.lower()]
-    return pub
+    value = (pub or "").strip()
+    if not value:
+        return value
+    lowered = value.lower()
+    if lowered in PUBLICATION_CACHE:
+        return PUBLICATION_CACHE[lowered]
+    if lowered in REVERSE_PUBLICATION_CACHE:
+        return lowered
+    return value
 
-
-def _publication_dirname(pub: str, rel: str, root: str = "ww") -> str:
+def _publication_dirname(pub: str, rel: str, root: str = "packages") -> str:
     return os.path.join(root, _publication_leaf(pub, rel))
 
-
 def _publication_leaf(pub: str, rel: str) -> str:
-    pub_key: str = REVERSE_PUBLICATION_CACHE.get(pub.lower(), pub.lower())
-    if rel == "latest":
-        return pub_key
-    return f"{pub_key}{rel.replace('.', '_').replace('-', '_')}"
-
+    # TODO: Adjust the on-disk naming scheme if your package manager needs one.
+    key = parsepub(pub).lower()
+    return key if rel == "latest" else f"{key}--{_release_token(rel)}"
 
 def _release_token(rel: str) -> str:
     return rel.replace(".", "_").replace("-", "_")
-
-
-def _dependency_file_path(path: str) -> str:
-    if path.endswith(".nitrodep"):
-        return path
-    return os.path.join(path, ".nitrodep")
-
 
 def _print_install_result(result: InstallResult, color: bool = True) -> None:
     labels: dict[str, str] = {
@@ -251,352 +495,59 @@ def _print_install_result(result: InstallResult, color: bool = True) -> None:
         else:
             print(f"[{label}] {line}")
 
-
-def _stage_file_path() -> str:
-    return os.path.join(".", NITROSTAGED_FILE)
-
-
-def _read_stage_lines() -> list[str]:
-    path: str = _stage_file_path()
-    if not os.path.exists(path):
-        return []
-    with open(path) as file:
-        return [line.rstrip("\n") for line in file if line.strip()]
-
-
-def _write_stage_lines(lines: list[str]) -> None:
-    path: str = _stage_file_path()
-    if not lines:
-        if os.path.exists(path):
-            os.remove(path)
-        return
-
-    with open(path, "w") as file:
-        file.write("\n".join(lines) + "\n")
-
-
-def _append_stage_line(line: str) -> None:
-    lines: list[str] = _read_stage_lines()
-    lines.append(line)
-    _write_stage_lines(lines)
-
-
-def _find_nitrodep_files(root_path: str) -> list[str]:
-    if root_path.endswith(".nitrodep") and os.path.isfile(root_path):
-        return [root_path]
-    found: list[str] = []
-    for current_root, _, files in os.walk(root_path):
-        if ".nitrodep" in files:
-            found.append(os.path.join(current_root, ".nitrodep"))
-    return sorted(found)
-
-
-def _read_nitrodep_entries(dep_path: str) -> list[tuple[str, str]]:
-    if not os.path.isfile(dep_path):
-        return []
-
-    entries: list[tuple[str, str]] = []
-    with open(dep_path) as file:
-        for raw_line in file:
-            line: str = raw_line.strip()
-            if not line:
-                continue
-            parts: list[str] = line.split()
-            publication: str = parsepub(parts[0]).lower()
-            release: str = parts[1] if len(parts) > 1 else "latest"
-            entries.append((publication, release))
-    return entries
-
-
-def _write_nitrodep_entries(dep_path: str, entries: list[tuple[str, str]]) -> None:
-    parent: str = os.path.dirname(dep_path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    with open(dep_path, "w") as file:
-        if entries:
-            file.write("\n".join(f"{pub} {rel}" if rel != "latest" else pub for pub, rel in entries) + "\n")
-
-
-def _add_nitrodep_dependency(path: str, pub: str, rel: str) -> bool:
-    dep_path: str = _dependency_file_path(path)
-    dep_key: tuple[str, str] = (parsepub(pub).lower(), rel)
-    entries: list[tuple[str, str]] = _read_nitrodep_entries(dep_path)
-    if dep_key in entries:
-        return False
-    entries.append(dep_key)
-    _write_nitrodep_entries(dep_path, entries)
-    return True
-
-
-def _remove_nitrodep_dependency(path: str, pub: str, rel: str) -> bool:
-    dep_path: str = _dependency_file_path(path)
-    if not os.path.isfile(dep_path):
-        return False
-
-    dep_key: tuple[str, str] = (parsepub(pub).lower(), rel)
-    entries: list[tuple[str, str]] = _read_nitrodep_entries(dep_path)
-    filtered: list[tuple[str, str]] = [entry for entry in entries if entry != dep_key]
-    if len(filtered) == len(entries):
-        return False
-    _write_nitrodep_entries(dep_path, filtered)
-    return True
-
-
-def _stage_tag_for_command(command: str) -> str | None:
-    return {
-        "get": "GET",
-        "getlib": "GETLIB",
-        "adddep": "ADDDEP",
-        "rmdep": "RMDEP",
-        "getdep": "GETDEP",
-        "forcegetdep": "FORCEGETDEP",
-        "updlibs": "UPDLIBS",
-        "compat": "COMPAT",
-        "rm": "RM",
-        "rmlib": "RMLIB",
-        "cmd": "RUNCMD",
-    }.get(command.lower())
-
-
-COMPAT_TAG: str = "#COMPAT"
-COMPAT_BUILTIN_PREFIXES: dict[str, str] = {
-    "abs-ww": "ww",
-    "abs": "",
-    "rel": "",
-    "rel-up1": ".",
-    "rel-up2": "..",
-    "rel-up3": "...",
-    "rel-ww": ".ww",
-    "rel-libs-ww": ".libraries.ww",
-}
-COMPAT_TAG: str = "#COMPAT"
-# Each compat mode is pure data: a prefix plus a join strategy, so adding a new mode never
-# requires touching the transform logic below - just add an entry here.
-#   "dot"      -> collapse the boundary between a trailing "." on the prefix and the sub-path's
-#                 leading "." into a single "." (namespace-style prefixes, e.g. "ww.", ".ww.")
-#   "raw"      -> concatenate prefix and sub-path verbatim, no collapsing (every "." is
-#                 meaningful, e.g. "up N levels" relative prefixes)
-#   "strip"    -> drop the sub-path's own leading "." entirely (plain absolute imports)
-#   "identity" -> the sub-path is already in canonical form; only the empty-path fallback is used
-COMPAT_MODES: dict[str, tuple[str, str]] = {
-    "abs-ww": ("ww.", "dot"),
-    "abs": ("", "strip"),
-    "rel": (".", "identity"),
-    "rel-up1": ("..", "raw"),
-    "rel-up2": ("...", "raw"),
-    "rel-up3": ("....", "raw"),
-    "rel-ww": (".ww.", "dot"),
-    "rel-libs-ww": (".libraries.ww.", "dot"),
-}
-_COMPAT_LINE_RE = re.compile(r'^(\s*)from\s+(?:\.?(?:libraries\.)?)ww(\.[^\s]*|)(\s+import\s+.*)$')
-_COMPAT_TAGGED_LINE_RE = re.compile(r'^(\s*)from\s+(\S+)(\s+import\s+.*)$')
-
-def _compat_new_path(mode: str, custom_phrase: str, rest: str) -> str | None:
-    if mode == "custom":
-        return custom_phrase + rest
-    if mode == "abs":
-        # absolute import with no leading dot, so drop the leading dot ww left on the sub-path
-        sub: str = rest[1:] if rest.startswith(".") else rest
-        return sub or None
-    if mode in ("rel", "rel-up1", "rel-up2", "rel-up3"):
-        # rest already carries its own leading dot (or is empty), so the prefix here holds only
-        # the *extra* up-level dots; pad with a bare "." when rest is empty to keep dot counts consistent
-        prefix: str = COMPAT_BUILTIN_PREFIXES[mode]
-        return prefix + rest if rest else prefix + "."
-    return COMPAT_BUILTIN_PREFIXES[mode] + rest
-
-def _compat_rest_from_tagged_path(path: str, custom_phrase: str) -> str:
-    # recover the canonical (dot-prefixed) sub-path after "ww" from a path already rewritten by any builtin/custom mode
-    for prefix in (".libraries.ww", ".ww", "ww"):
-        if path.startswith(prefix):
-            return path[len(prefix):]
-    if custom_phrase and path.startswith(custom_phrase):
-        return path[len(custom_phrase):]
-    stripped: str = path.lstrip(".")
-    if path and stripped != path:
-        # path was purely dots (rel/rel-upN result), so re-normalize to a single leading dot (or none)
-        # instead of keeping every up-level dot, which would compound on repeated transforms
-        return "." + stripped if stripped else ""
-    if path in ("", "."):
-        return ""
-    return path if path.startswith(".") else "." + path
-
-def _compat_transform_line(line: str, mode: str, custom_phrase: str) -> str | None:
-    ending: str = "\n" if line.endswith("\n") else ""
-    body: str = line[:-1] if ending else line
-    stripped: str = body.strip()
-    is_tagged: bool = stripped.endswith(COMPAT_TAG)
-    if not (stripped.startswith("from ww") or is_tagged):
-        return None
-    working: str = body
-    if working.rstrip().endswith(COMPAT_TAG):
-        tag_index: int = working.rstrip().rfind(COMPAT_TAG)
-        working = working[:tag_index].rstrip()
-
-    if is_tagged:
-        tagged_match: re.Match | None = _COMPAT_TAGGED_LINE_RE.match(working)
-        if tagged_match is None:
-            return None
-        leading_ws, path, import_clause = tagged_match.group(1), tagged_match.group(2), tagged_match.group(3)
-        rest: str = _compat_rest_from_tagged_path(path, custom_phrase)
-    else:
-        match: re.Match | None = _COMPAT_LINE_RE.match(working)
-        if match is None:
-            return None
-        leading_ws, rest, import_clause = match.group(1), match.group(2), match.group(3)
-
-    new_path: str | None = _compat_new_path(mode, custom_phrase, rest)
-    if new_path is None:
-        return None
-    new_body: str = f"from {leading_ws}{new_path}{import_clause}  {COMPAT_TAG}"
-    if new_body == body:
-        return None
-    return new_body + ending
-
-def _iter_python_files(root: str):
-    if os.path.isfile(root):
-        if root.endswith(".py"):
-            yield root
-        return
-    for dirpath, _dirnames, filenames in os.walk(root):
-        for filename in filenames:
-            if filename.endswith(".py"):
-                yield os.path.join(dirpath, filename)
-
-def _apply_compat(directory: str, mode: str, custom_phrase: str) -> tuple[int, int]:
-    files_changed: int = 0
-    lines_changed: int = 0
-    for path in _iter_python_files(directory):
-        with open(path) as file:
-            lines: list[str] = file.readlines()
-        changed: bool = False
-        for i, line in enumerate(lines):
-            new_line: str | None = _compat_transform_line(line, mode, custom_phrase)
-            if new_line is not None:
-                lines[i] = new_line
-                changed = True
-                lines_changed += 1
-        if changed:
-            with open(path, "w") as file:
-                file.writelines(lines)
-            files_changed += 1
-    return files_changed, lines_changed
-
-
 def _remove_publication_versions(install_root: str, pub: str, rel: str | None = None) -> int:
     if not os.path.isdir(install_root):
         return 0
-
-    resolved_pub: str = parsepub(pub).lower()
-    symbol: str = REVERSE_PUBLICATION_CACHE.get(resolved_pub, resolved_pub)
-    prefixes: set[str] = {resolved_pub, symbol}
-    deleted: int = 0
-
-    expected_names: set[str] = set()
-    if rel is not None:
-        expected_names = {prefix + _release_token(rel) for prefix in prefixes}
-        if rel == "latest":
-            expected_names |= prefixes
-
-    for path in os.listdir(install_root):
-        full_path: str = os.path.join(install_root, path)
+    resolved_pub = parsepub(pub).lower()
+    deleted = 0
+    for name in os.listdir(install_root):
+        full_path = os.path.join(install_root, name)
         if not os.path.isdir(full_path):
             continue
-
-        path_lower: str = path.lower()
-        should_delete: bool
-        if rel is None:
-            should_delete = any(path_lower.startswith(prefix) for prefix in prefixes)
+        marker = os.path.join(full_path, ".sourcegen-package.json")
+        if os.path.isfile(marker):
+            try:
+                with open(marker, encoding="utf-8") as handle:
+                    metadata = json.load(handle)
+                package_name, package_release = str(metadata["package"]).lower(), str(metadata["release"])
+            except (ValueError, KeyError, OSError, TypeError):
+                continue
         else:
-            should_delete = path_lower in expected_names
-
-        if should_delete:
+            # Do not delete unknown, non-Sourcegen directories.
+            continue
+        if package_name == resolved_pub and (rel is None or rel == package_release):
             shutil.rmtree(full_path)
             deleted += 1
-
     return deleted
 
-
 def _parse_installed_publication_dir(dirname: str) -> tuple[str, str] | None:
-    directory_name: str = dirname.lower()
-    candidates: list[tuple[str, str]] = []
-    for symbol, publication in PUBLICATION_CACHE.items():
-        candidates.append((symbol, publication))
-    for publication in REVERSE_PUBLICATION_CACHE:
-        candidates.append((publication, publication))
+    # A metadata marker permits arbitrary product names and release formats.
+    marker = os.path.join(INTERNAL_PACKAGES_DIR, dirname, ".sourcegen-package.json")
+    if os.path.isfile(marker):
+        try:
+            with open(marker, encoding="utf-8") as f:
+                info = json.load(f)
+            return str(info["package"]), str(info["release"])
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+    # Fallback for archives cached before marker metadata existed.
+    for symbol, publication in sorted(PUBLICATION_CACHE.items(), key=lambda p: -len(p[0])):
+        if dirname.lower().startswith(symbol):
+            suffix = dirname[len(symbol):]
+            return publication, (suffix.replace("_", ".") if suffix else "latest")
+    return dirname, "latest"  # Unversioned generic cache directory
 
-    seen: set[str] = set()
-    ordered_candidates: list[tuple[str, str]] = []
-    for prefix, publication in sorted(candidates, key=lambda item: len(item[0]), reverse=True):
-        if prefix in seen:
-            continue
-        seen.add(prefix)
-        ordered_candidates.append((prefix, publication))
-
-    for prefix, publication in ordered_candidates:
-        if not directory_name.startswith(prefix):
-            continue
-        suffix: str = directory_name[len(prefix):]
-        if not suffix:
-            return publication, "latest"
-        if not all(char.isalnum() or char == "_" for char in suffix):
-            continue
-        release: str = suffix.replace("_", ".")
-        return publication, release
-    return None
-
-
-@dataclass(slots=True)
-class StageAction:
-    action: str
-    args: list[str]
-    raw: str
-
-
-def _parse_stage_line(line: str) -> StageAction | None:
-    if line.startswith("RUNCMD|"):
-        return StageAction("RUNCMD", [line[len("RUNCMD|"):]], line)
-    parts: list[str] = line.split("|")
-    if not parts:
-        return None
-    action: str = parts[0]
-    args: list[str] = parts[1:]
-    arity: dict[str, int] = {
-        "ADDDEP": 2,
-        "ADDLIB": 3,
-        "ADDNDEP": 2,
-        "RMNDEP": 2,
-        "GETDEP": 1,
-        "FORCEGETDEP": 1,
-        "UPDLIBS": 1,
-        "RMDEP": 2,
-        "RMLIB": 3,
-        "COMPAT": 3,
-    }
-    if action not in arity:
-        return None
-    if len(args) != arity[action]:
-        return None
-    return StageAction(action, args, line)
-
-
-def _run_staged_command(command: str) -> None:
-    _print_status("cmd", command, "info")
-    result: subprocess.CompletedProcess = subprocess.run(command, shell=True, cwd=os.getcwd())
-    if result.returncode != 0:
-        _print_status("fail", f"Command failed with exit code {result.returncode}: {command}", "error")
-        raise SystemExit(result.returncode)
-
-
-def _queue_install_to_root(pub: str, rel: str, install_root: str, reinstall: bool = True, work_dir: str = ".") -> asyncio.Task:
+def _queue_install_to_root(pub: str, rel: str, install_root: str, reinstall: bool = True, work_dir: str = ".", emit: bool = True, error: bool = False) -> asyncio.Task:
     resolved_pub: str = parsepub(pub)
     key: tuple[str, str, str] = (resolved_pub.lower(), rel, os.path.realpath(install_root))
     if key in running_installs:
-        _print_status("wait", f"Already queued {resolved_pub.lower()} {rel} -> {install_root}", "muted")
+        if emit:
+            _print_status("wait", f"Already queued {resolved_pub.lower()} {rel} -> {install_root}", "muted")
         return running_installs[key]
 
-    _print_status("queue", f"{resolved_pub.lower()} {rel} -> {install_root}", "info")
-    task: asyncio.Task = asyncio.create_task(asyncio.to_thread(_install_publication_to_root, resolved_pub, rel, install_root, reinstall, work_dir))
+    if emit:
+        _print_status("queue", f"{resolved_pub.lower()} {rel} -> {install_root}", "info")
+    task: asyncio.Task = asyncio.create_task(asyncio.to_thread(_install_publication_to_root, resolved_pub, rel, install_root, reinstall, work_dir, emit, error))
     running_installs[key] = task
 
     def cleanup(completed_task: asyncio.Task, install_key: tuple[str, str, str] = key) -> None:
@@ -606,469 +557,8 @@ def _queue_install_to_root(pub: str, rel: str, install_root: str, reinstall: boo
     task.add_done_callback(cleanup)
     return task
 
-
-async def _execute_stage_ordered(actions: list[StageAction]) -> None:
-    for action in actions:
-        if action.action == "ADDDEP":
-            pub, rel = action.args
-            result: InstallResult = await _queue_install_to_root(pub, rel, "ww", True)
-            _print_install_result(result)
-            if result.exit_code:
-                raise SystemExit(result.exit_code)
-        elif action.action == "ADDLIB":
-            project, pub, rel = action.args
-            install_root: str = os.path.join(project, "libraries", "ww")
-            result = await _queue_install_to_root(pub, rel, install_root, True)
-            _print_install_result(result)
-            if result.exit_code:
-                raise SystemExit(result.exit_code)
-        elif action.action == "ADDNDEP":
-            pub, rel = action.args
-            if _add_nitrodep_dependency(".", pub, rel):
-                _print_status("done", f"Added dependency '{parsepub(pub).lower()} {rel}' to ./.nitrodep.", "success")
-            else:
-                _print_status("info", f"Dependency '{parsepub(pub).lower()} {rel}' is already in ./.nitrodep.", "muted")
-        elif action.action == "RMNDEP":
-            pub, rel = action.args
-            if _remove_nitrodep_dependency(".", pub, rel):
-                _print_status("done", f"Removed dependency '{parsepub(pub).lower()} {rel}' from ./.nitrodep.", "success")
-            else:
-                _print_status("miss", f"Dependency '{parsepub(pub).lower()} {rel}' was not found in ./.nitrodep.", "warning")
-        elif action.action == "GETDEP":
-            target = action.args[0]
-            await getdep_everywhere(target)
-        elif action.action == "FORCEGETDEP":
-            target = action.args[0]
-            await getdep_everywhere(target, force=True)
-        elif action.action == "UPDLIBS":
-            project = action.args[0]
-            await _reinstall_project_libraries(project)
-        elif action.action == "RMDEP":
-            pub, rel = action.args
-            deleted: int = _remove_publication_versions("ww", pub, rel)
-            _print_status("done", f"Removed {deleted} release{'s' if deleted != 1 else ''} of '{parsepub(pub).lower()}' ({rel}) from ./ww.", "success")
-        elif action.action == "RMLIB":
-            project, pub, rel = action.args
-            install_root = os.path.join(project, "libraries", "ww")
-            deleted = _remove_publication_versions(install_root, pub, rel)
-            _print_status("done", f"Removed {deleted} release{'s' if deleted != 1 else ''} of '{parsepub(pub).lower()}' ({rel}) from ./{project}/libraries/ww.", "success")
-        elif action.action == "RUNCMD":
-            _run_staged_command(action.args[0])
-        elif action.action == "COMPAT":
-            mode, target, custom_phrase = action.args
-            files_changed, lines_changed = _apply_compat(target, mode, custom_phrase)
-            _print_status("done", f"Compatibility rewrite completed: {files_changed} file{'s' if files_changed != 1 else ''} changed with {lines_changed} line{'s' if lines_changed != 1 else ''} modified.", "success")
-
-
-async def _commit_stage_batched(actions: list[StageAction]) -> None:
-    add_dep: list[tuple[str, str]] = []
-    add_lib: list[tuple[str, str, str]] = []
-    rm_dep: list[tuple[str, str]] = []
-    rm_lib: list[tuple[str, str, str]] = []
-
-    for action in actions:
-        if action.action == "ADDDEP":
-            add_dep.append((action.args[0], action.args[1]))
-        elif action.action == "ADDLIB":
-            add_lib.append((action.args[0], action.args[1], action.args[2]))
-        elif action.action == "RMDEP":
-            rm_dep.append((action.args[0], action.args[1]))
-        elif action.action == "RMLIB":
-            rm_lib.append((action.args[0], action.args[1], action.args[2]))
-
-    add_dep_pub: set[tuple[str, str]] = {(parsepub(pub).lower(), rel) for pub, rel in add_dep}
-    rm_dep_pub: set[tuple[str, str]] = {(parsepub(pub).lower(), rel) for pub, rel in rm_dep}
-    dep_conflicts: set[tuple[str, str]] = add_dep_pub & rm_dep_pub
-    if dep_conflicts:
-        text: str = ", ".join(f"{pub} {rel}" for pub, rel in sorted(dep_conflicts))
-        _print_status("fail", f"Cannot commit: adddep and rmdep conflict for {text}", "error")
-        raise SystemExit(1)
-
-    add_lib_pub: set[tuple[str, str, str]] = {(project, parsepub(pub).lower(), rel) for project, pub, rel in add_lib}
-    rm_lib_pub: set[tuple[str, str, str]] = {(project, parsepub(pub).lower(), rel) for project, pub, rel in rm_lib}
-    lib_conflicts: set[tuple[str, str, str]] = add_lib_pub & rm_lib_pub
-    if lib_conflicts:
-        text = ", ".join(f"{project}:{pub} {rel}" for project, pub, rel in sorted(lib_conflicts))
-        _print_status("fail", f"Cannot commit: addlib and rmlib conflict in same stage for {text}", "error")
-        raise SystemExit(1)
-
-    command_failures: int = 0
-    for action in actions:
-        if action.action == "RUNCMD":
-            try:
-                _run_staged_command(action.args[0])
-            except SystemExit as err:
-                command_failures = int(err.code) if isinstance(err.code, int) else 1
-                break
-        elif action.action == "ADDNDEP":
-            pub, rel = action.args
-            if _add_nitrodep_dependency(".", pub, rel):
-                _print_status("done", f"Added dependency '{parsepub(pub).lower()} {rel}' to ./.nitrodep.", "success")
-            else:
-                _print_status("info", f"Dependency '{parsepub(pub).lower()} {rel}' is already in ./.nitrodep.", "muted")
-        elif action.action == "RMNDEP":
-            pub, rel = action.args
-            if _remove_nitrodep_dependency(".", pub, rel):
-                _print_status("done", f"Removed dependency '{parsepub(pub).lower()} {rel}' from ./.nitrodep.", "success")
-            else:
-                _print_status("miss", f"Dependency '{parsepub(pub).lower()} {rel}' was not found in ./.nitrodep.", "warning")
-        elif action.action == "GETDEP":
-            target = action.args[0]
-            await getdep_everywhere(target)
-        elif action.action == "FORCEGETDEP":
-            target = action.args[0]
-            await getdep_everywhere(target, force=True)
-        elif action.action == "UPDLIBS":
-            project = action.args[0]
-            await _reinstall_project_libraries(project)
-    if command_failures:
-        raise SystemExit(command_failures)
-
-    install_tasks: list[asyncio.Task] = []
-    for pub, rel in add_dep:
-        install_tasks.append(_queue_install_to_root(pub, rel, "ww", True))
-    for project, pub, rel in add_lib:
-        install_tasks.append(_queue_install_to_root(pub, rel, os.path.join(project, "libraries", "ww"), True))
-
-    if install_tasks:
-        install_results: list[InstallResult] = await asyncio.gather(*install_tasks)
-        install_failures: int = 0
-        for result in install_results:
-            _print_install_result(result)
-            install_failures += int(bool(result.exit_code))
-        if install_failures:
-            _print_status("fail", f"Commit install finished with {install_failures} failure{'s' if install_failures != 1 else ''}.", "error")
-            raise SystemExit(1)
-
-    for pub, rel in rm_dep:
-        deleted: int = _remove_publication_versions("ww", pub, rel)
-        _print_status("done", f"Removed {deleted} release{'s' if deleted != 1 else ''} of '{parsepub(pub).lower()}' ({rel}) from ./ww.", "success")
-    for project, pub, rel in rm_lib:
-        install_root: str = os.path.join(project, "libraries", "ww")
-        deleted = _remove_publication_versions(install_root, pub, rel)
-        _print_status("done", f"Removed {deleted} release{'s' if deleted != 1 else ''} of '{parsepub(pub).lower()}' ({rel}) from ./{project}/libraries/ww.", "success")
-
-
-async def _run_staged(mode: str) -> None:
-    lines: list[str] = _read_stage_lines()
-    if not lines:
-        _print_status("info", "Nothing staged.", "muted")
-        return
-
-    actions: list[StageAction] = []
-    for line in lines:
-        parsed: StageAction | None = _parse_stage_line(line)
-        if parsed is None:
-            _print_status("fail", f"Invalid stage line: {line}", "error")
-            raise SystemExit(1)
-        actions.append(parsed)
-
-    if mode == "execute":
-        await _execute_stage_ordered(actions)
-    else:
-        await _commit_stage_batched(actions)
-
-    _write_stage_lines([])
-    _print_status("done", f"Stage completed in {mode} mode.", "success")
-
-async def _handle_stage_command(args: list[str]) -> None:
-    if not args:
-        _print_status("help", f"Usage: {COMMAND} stage <get|getlib|adddep|rmdep|getdep|forcegetdep|updlibs|rm|rmlib|compat|cmd|getinternal|rminternal|getdepinternal|cancel|execute|commit> [...]", "warning")
-        sys.exit(1)
-
-    subcommand: str = args[0].lower()
-
-    if subcommand == "get":
-        if len(args) < 2:
-            _print_status("help", f"Usage: {COMMAND} stage get <publication> [release]", "warning")
-            sys.exit(1)
-        pub: str = parsepub(args[1]).lower()
-        rel: str = args[2] if len(args) > 2 else "latest"
-        _append_stage_line(f"ADDDEP|{pub}|{rel}")
-        _print_status("stage", f"Staged get {pub} {rel}", "success")
-        return
-
-    if subcommand == "getlib":
-        if len(args) < 3:
-            _print_status("help", f"Usage: {COMMAND} stage getlib <project> <publication> [release]", "warning")
-            sys.exit(1)
-        project: str = args[1]
-        pub = parsepub(args[2]).lower()
-        rel = args[3] if len(args) > 3 else "latest"
-        _append_stage_line(f"ADDLIB|{project}|{pub}|{rel}")
-        _print_status("stage", f"Staged getlib {project} {pub} {rel}", "success")
-        return
-
-    if subcommand == "adddep":
-        if len(args) < 2:
-            _print_status("help", f"Usage: {COMMAND} stage adddep <publication> [release]", "warning")
-            sys.exit(1)
-        pub = parsepub(args[1]).lower()
-        rel = args[2] if len(args) > 2 else "latest"
-        _append_stage_line(f"ADDNDEP|{pub}|{rel}")
-        _print_status("stage", f"Staged adddep {pub} {rel}", "success")
-        return
-
-    if subcommand == "rmdep":
-        if len(args) < 2:
-            _print_status("help", f"Usage: {COMMAND} stage rmdep <publication> [release]", "warning")
-            sys.exit(1)
-        pub = parsepub(args[1]).lower()
-        rel = args[2] if len(args) > 2 else "latest"
-        _append_stage_line(f"RMNDEP|{pub}|{rel}")
-        _print_status("stage", f"Staged rmdep {pub} {rel}", "success")
-        return
-
-    if subcommand == "getdep":
-        if len(args) > 2:
-            _print_status("help", f"Usage: {COMMAND} stage getdep [target]", "warning")
-            sys.exit(1)
-        target: str = args[1] if len(args) > 1 else "."
-        _append_stage_line(f"GETDEP|{target}")
-        _print_status("stage", f"Staged getdep {target}", "success")
-        return
-
-    if subcommand == "forcegetdep":
-        if len(args) > 2:
-            _print_status("help", f"Usage: {COMMAND} stage forcegetdep [target]", "warning")
-            sys.exit(1)
-        target = args[1] if len(args) > 1 else "."
-        _append_stage_line(f"FORCEGETDEP|{target}")
-        _print_status("stage", f"Staged forcegetdep {target}", "success")
-        return
-
-    if subcommand == "updlibs":
-        if len(args) > 2:
-            _print_status("help", f"Usage: {COMMAND} stage updlibs [target]", "warning")
-            sys.exit(1)
-        target = args[1] if len(args) > 1 else "."
-        _append_stage_line(f"UPDLIBS|{target}")
-        _print_status("stage", f"Staged updlibs {target}", "success")
-        return
-
-    if subcommand == "rm":
-        if len(args) < 2:
-            _print_status("help", f"Usage: {COMMAND} stage rm <publication> [release]", "warning")
-            sys.exit(1)
-        pub = parsepub(args[1]).lower()
-        rel = args[2] if len(args) > 2 else "latest"
-        _append_stage_line(f"RMDEP|{pub}|{rel}")
-        _print_status("stage", f"Staged rm {pub} {rel}", "success")
-        return
-
-    if subcommand == "rmlib":
-        if len(args) < 3:
-            _print_status("help", f"Usage: {COMMAND} stage rmlib <project> <publication> [release]", "warning")
-            sys.exit(1)
-        project: str = args[1]
-        pub = parsepub(args[2]).lower()
-        rel = args[3] if len(args) > 3 else "latest"
-        _append_stage_line(f"RMLIB|{project}|{pub}|{rel}")
-        _print_status("stage", f"Staged rmlib {project} {pub} {rel}", "success")
-        return
-
-    if subcommand == "getinternal":
-        if len(args) < 2:
-            _print_status("help", f"Usage: {COMMAND} stage getinternal <publication> [release]", "warning")
-            sys.exit(1)
-        pub = parsepub(args[1]).lower()
-        rel = args[2] if len(args) > 2 else "latest"
-        _append_stage_line(f"GETINTERNAL|{pub}|{rel}")
-        _print_status("stage", f"Staged getinternal {pub} {rel}", "success")
-        return
-
-    if subcommand == "rminternal":
-        if len(args) < 2:
-            _print_status("help", f"Usage: {COMMAND} stage rminternal <publication> [release]", "warning")
-            sys.exit(1)
-        pub = parsepub(args[1]).lower()
-        rel = args[2] if len(args) > 2 else "latest"
-        _append_stage_line(f"RMINTERNAL|{pub}|{rel}")
-        _print_status("stage", f"Staged rminternal {pub} {rel}", "success")
-        return
-
-    if subcommand == "getdepinternal":
-        if len(args) > 2:
-            _print_status("help", f"Usage: {COMMAND} stage getdepinternal [target]", "warning")
-            sys.exit(1)
-        target = args[1] if len(args) > 1 else "."
-        _append_stage_line(f"GETDEPINTERNAL|{target}")
-        _print_status("stage", f"Staged getdepinternal {target}", "success")
-        return
-
-    if subcommand == "compat":
-        if len(args) < 3:
-            _print_status("help", f"Usage: {COMMAND} stage compat <mode> <publication|directory> [custom-phrase]", "warning")
-            sys.exit(1)
-        mode: str = args[1]
-        target: str = args[2]
-        if mode not in COMPAT_MODES and mode != "custom":
-            _print_status("help", f"Usage: {COMMAND} stage compat <mode(abs|rel|rel-up1|rel-up2|rel-up3|abs-ww|rel-ww|rel-libs-ww|custom)> <publication|directory> [custom-phrase]", "warning")
-            sys.exit(1)
-        custom_phrase: str = ""
-        if mode == "custom":
-            if len(args) < 4:
-                _print_status("help", f"Usage: {COMMAND} stage compat custom <publication|directory> <custom-phrase>", "warning")
-                sys.exit(1)
-            custom_phrase = args[3]
-        _append_stage_line(f"COMPAT|{mode}|{target}|{custom_phrase}")
-        _print_status("stage", f"Staged compat {mode} {target}", "success")
-        return
-
-    if subcommand == "cmd":
-        if len(args) < 2:
-            _print_status("help", f"Usage: {COMMAND} stage cmd <command>", "warning")
-            sys.exit(1)
-        command: str = " ".join(args[1:])
-        _append_stage_line(f"RUNCMD|{command}")
-        _print_status("stage", f"Staged cmd: {command}", "success")
-        return
-
-    if subcommand == "cancel":
-        lines: list[str] = _read_stage_lines()
-        if not lines:
-            _print_status("info", "Nothing staged.", "muted")
-            sys.exit(0)
-
-        if len(args) == 1:
-            _write_stage_lines([])
-            _print_status("done", "Cleared entire stage.", "success")
-            sys.exit(0)
-
-        if args[1].lower() == "last":
-            removed_line: str = lines.pop()
-            _write_stage_lines(lines)
-            _print_status("done", f"Canceled last staged line: {removed_line}", "success")
-            sys.exit(0)
-
-        command_name: str = args[1].lower()
-        tag: str | None = _stage_tag_for_command(command_name)
-        if tag is None:
-            _print_status("help", f"Usage: {COMMAND} stage cancel [get|getlib|adddep|rmdep|getdep|forcegetdep|updlibs|rm|rmlib|compat|cmd|getinternal|rminternal|getdepinternal|last] [args]", "warning")
-            sys.exit(1)
-
-        target_line: str | None = None
-        if tag == "GET":
-            if len(args) < 3:
-                _print_status("help", f"Usage: {COMMAND} stage cancel get <publication> [release]", "warning")
-                sys.exit(1)
-            publication: str = parsepub(args[2]).lower()
-            release: str = args[3] if len(args) > 3 else "latest"
-            target_line = f"ADDDEP|{publication}|{release}"
-        elif tag == "GETLIB":
-            if len(args) < 4:
-                _print_status("help", f"Usage: {COMMAND} stage cancel getlib <project> <publication> [release]", "warning")
-                sys.exit(1)
-            project = args[2]
-            publication = parsepub(args[3]).lower()
-            release = args[4] if len(args) > 4 else "latest"
-            target_line = f"ADDLIB|{project}|{publication}|{release}"
-        elif tag == "ADDDEP":
-            if len(args) < 3:
-                _print_status("help", f"Usage: {COMMAND} stage cancel adddep <publication> [release]", "warning")
-                sys.exit(1)
-            publication = parsepub(args[2]).lower()
-            release = args[3] if len(args) > 3 else "latest"
-            target_line = f"ADDNDEP|{publication}|{release}"
-        elif tag == "RMDEP":
-            if len(args) < 3:
-                _print_status("help", f"Usage: {COMMAND} stage cancel rmdep <publication> [release]", "warning")
-                sys.exit(1)
-            publication = parsepub(args[2]).lower()
-            release = args[3] if len(args) > 3 else "latest"
-            target_line = f"RMNDEP|{publication}|{release}"
-        elif tag == "GETDEP":
-            if len(args) > 3:
-                _print_status("help", f"Usage: {COMMAND} stage cancel getdep [target]", "warning")
-                sys.exit(1)
-            target: str = args[2] if len(args) > 2 else "."
-            target_line = f"GETDEP|{target}"
-        elif tag == "FORCEGETDEP":
-            if len(args) > 3:
-                _print_status("help", f"Usage: {COMMAND} stage cancel forcegetdep [target]", "warning")
-                sys.exit(1)
-            target = args[2] if len(args) > 2 else "."
-            target_line = f"FORCEGETDEP|{target}"
-        elif tag == "UPDLIBS":
-            if len(args) > 3:
-                _print_status("help", f"Usage: {COMMAND} stage cancel updlibs [target]", "warning")
-                sys.exit(1)
-            target = args[2] if len(args) > 2 else "."
-            target_line = f"UPDLIBS|{target}"
-        elif tag == "RM":
-            if len(args) < 3:
-                _print_status("help", f"Usage: {COMMAND} stage cancel rm <publication> [release]", "warning")
-                sys.exit(1)
-            publication = parsepub(args[2]).lower()
-            release = args[3] if len(args) > 3 else "latest"
-            target_line = f"RMDEP|{publication}|{release}"
-        elif tag == "RMLIB":
-            if len(args) < 4:
-                _print_status("help", f"Usage: {COMMAND} stage cancel rmlib <project> <publication> [release]", "warning")
-                sys.exit(1)
-            project = args[2]
-            publication = parsepub(args[3]).lower()
-            release = args[4] if len(args) > 4 else "latest"
-            target_line = f"RMLIB|{project}|{publication}|{release}"
-        elif tag == "COMPAT":
-            if len(args) < 5:
-                _print_status("help", f"Usage: {COMMAND} stage cancel compat <mode> <target> <custom_phrase>", "warning")
-                sys.exit(1)
-            mode = args[2]
-            target = args[3]
-            custom_phrase = args[4]
-            target_line = f"COMPAT|{mode}|{target}|{custom_phrase}"
-        elif tag == "RUNCMD":
-            if len(args) < 3:
-                _print_status("help", f"Usage: {COMMAND} stage cancel cmd <command>", "warning")
-                sys.exit(1)
-            command = " ".join(args[2:])
-            target_line = f"RUNCMD|{command}"
-        elif tag == "GETINTERNAL":
-            if len(args) < 3:
-                _print_status("help", f"Usage: {COMMAND} stage cancel getinternal <publication> [release]", "warning")
-                sys.exit(1)
-            publication = parsepub(args[2]).lower()
-            release = args[3] if len(args) > 3 else "latest"
-            target_line = f"GETINTERNAL|{publication}|{release}"
-        elif tag == "RMINTERNAL":
-            if len(args) < 3:
-                _print_status("help", f"Usage: {COMMAND} stage cancel rminternal <publication> [release]", "warning")
-                sys.exit(1)
-            publication = parsepub(args[2]).lower()
-            release = args[3] if len(args) > 3 else "latest"
-            target_line = f"RMINTERNAL|{publication}|{release}"
-        elif tag == "GETDEPINTERNAL":
-            if len(args) > 3:
-                _print_status("help", f"Usage: {COMMAND} stage cancel getdepinternal [target]", "warning")
-                sys.exit(1)
-            target = args[2] if len(args) > 2 else "."
-            target_line = f"GETDEPINTERNAL|{target}"
-
-        if target_line is None:
-            _print_status("fail", "Could not build a stage target for cancellation.", "error")
-            sys.exit(1)
-
-        try:
-            lines.remove(target_line)
-        except ValueError:
-            _print_status("miss", f"No matching staged line found: {target_line}", "warning")
-            sys.exit(1)
-
-        _write_stage_lines(lines)
-        _print_status("done", f"Canceled: {target_line}", "success")
-        return
-
-    if subcommand in {"execute", "commit"}:
-        await _run_staged(subcommand)
-        return
-
-    _print_status("help", f"Unknown stage subcommand: {subcommand}", "warning")
-    _print_status("help", f"Usage: {COMMAND} stage <get|getlib|adddep|rmdep|getdep|forcegetdep|updlibs|rm|rmlib|compat|cmd|getinternal|rminternal|getdepinternal|cancel|execute|commit> [...]", "warning")
-    sys.exit(1)
-    
 async def _reinstall_project_libraries(project: str) -> None:
-    install_root: str = os.path.join(project, "libraries", "ww")
+    install_root: str = os.path.join(project, "libraries", "packages")
     if not os.path.isdir(install_root):
         _print_status("miss", f"No library directory found at '{install_root}'.", "warning")
         raise SystemExit(1)
@@ -1107,18 +597,28 @@ async def _reinstall_project_libraries(project: str) -> None:
     _print_status("done", f"Reinstalled {len(results)} librar{'y' if len(results) == 1 else 'ies'} from {install_root}.", "success")
 
 def _install_publication(pub: str, rel: str, reinstall: bool = True) -> InstallResult:
-    return _install_publication_to_root(pub, rel, "ww", reinstall)
+    return _install_publication_to_root(pub, rel, "packages", reinstall)
 
-def _install_publication_to_root(pub: str, rel: str, install_root: str, reinstall: bool = True, work_dir: str = ".") -> InstallResult:
+def _install_publication_to_root(pub: str, rel: str, install_root: str, reinstall: bool = True, work_dir: str = ".", emit: bool = True, error: bool = False) -> InstallResult:
     pub = parsepub(pub)
     pub_lower: str = pub.lower()
     dirname: str = os.path.join(install_root, _publication_leaf(pub, rel))
     release_token: str = _release_token(rel)
     archive_path: str = os.path.join(work_dir, f"{pub_lower}-{release_token}.zip")
     extract_dir: str = os.path.join(work_dir, f"{pub_lower}-repo-{release_token}")
-    url: str = f"https://github.com/Wednesware/{pub.capitalize()}/archive/refs/heads/main.zip" if rel == "beta" else f"https://github.com/Wednesware/{pub.capitalize()}/releases/{rel + '/download' if rel == 'latest' else 'download/' + rel}/{pub_lower}.zip"
+    custom_result = custom_install_package(pub, rel, install_root, work_dir)
+    if custom_result is not None:
+        if not custom_result.exit_code:
+            os.makedirs(dirname, exist_ok=True)
+            with open(os.path.join(dirname, ".sourcegen-package.json"), "w", encoding="utf-8") as marker:
+                json.dump({"package": pub, "release": rel}, marker)
+        return custom_result
+    url: str = resolve_download_url(pub, rel)  # TODO: configure resolver above
+    not_found: bool = False
     try:
         if os.path.exists(dirname) and not reinstall:
+            if emit:
+                _print_status("info", f"{pub_lower} {rel}: Publication is already installed.", "muted")
             return InstallResult("info", [f"{pub_lower} {rel}: Publication is already installed."])
         os.makedirs(work_dir, exist_ok=True)
         try:
@@ -1127,6 +627,7 @@ def _install_publication_to_root(pub: str, rel: str, install_root: str, reinstal
                 archive_path,
             )
         except urllib.error.HTTPError:
+            not_found = True
             return InstallResult(
                 "error",
                 [f"{pub_lower} {rel}: Could not find this release. Are you sure you spelled it right?"],
@@ -1139,8 +640,14 @@ def _install_publication_to_root(pub: str, rel: str, install_root: str, reinstal
         if os.path.exists(dirname):
             shutil.rmtree(dirname)
 
-        source_root: str = next(os.scandir(extract_dir)).name
-        shutil.move(os.path.join(extract_dir, source_root, pub_lower), dirname)
+        source_root: str = resolve_extracted_source(extract_dir, pub, rel)
+        if not os.path.isdir(source_root):
+            raise ValueError(f"Download resolver returned invalid source directory: {source_root}")
+        shutil.move(source_root, dirname)
+        with open(os.path.join(dirname, ".sourcegen-package.json"), "w", encoding="utf-8") as marker:
+            json.dump({"package": pub, "release": rel}, marker)
+        if emit:
+            _print_status("done", f"{pub_lower} {rel}: Installation complete!", "success")
         return InstallResult("success", [f"{pub_lower} {rel}: Installation complete!"])
     except Exception:
         return InstallResult(
@@ -1153,243 +660,19 @@ def _install_publication_to_root(pub: str, rel: str, install_root: str, reinstal
             shutil.rmtree(extract_dir)
         if os.path.exists(archive_path):
             os.remove(archive_path)
+        if error and not_found:
+            raise FileNotFoundError(f"Could not find release '{rel}' for publication '{pub_lower}'.")
 
+def _queue_install(pub: str, rel: str, reinstall: bool = True, install_root: str = "packages", work_dir: str = ".", emit: bool = True, error: bool = False) -> asyncio.Task:
+    return _queue_install_to_root(pub, rel, install_root, reinstall, work_dir, emit, error=error)
 
-def _queue_install(pub: str, rel: str, reinstall: bool = True, install_root: str = "ww", work_dir: str = ".") -> asyncio.Task:
-    return _queue_install_to_root(pub, rel, install_root, reinstall, work_dir)
-
-async def install_async(pub: str, rel: str, reinstall: bool = True, color: bool = True, emit: bool = True, fatal: bool = True, install_root: str = "ww", work_dir: str = ".") -> InstallResult:
-    result: InstallResult = await _queue_install(pub, rel, reinstall, install_root, work_dir)
+async def install_async(pub: str, rel: str, reinstall: bool = True, color: bool = True, emit: bool = True, fatal: bool = True, install_root: str = "packages", work_dir: str = ".", error: bool = False) -> InstallResult:
+    result: InstallResult = await _queue_install(pub, rel, reinstall, install_root, work_dir, emit, error)
     if emit:
         _print_install_result(result, color)
     if fatal and result.exit_code:
         raise SystemExit(result.exit_code)
     return result
-
-
-async def _getdep_recursive(path: str, color: bool = True, log: bool = True, visited: set[str] | None = None, installed: set[tuple[str, str]] | None = None, force: bool = False, install_root: str = "ww", work_dir: str = ".") -> None:
-    dep_path: str = _dependency_file_path(path)
-    if visited is None:
-        visited = set()
-    if installed is None:
-        installed = set()
-    resolved_path: str = os.path.realpath(dep_path)
-    if resolved_path in visited:
-        return
-    visited.add(resolved_path)
-
-    if not os.path.isfile(dep_path):
-        _print_status("miss", f"No dependency file found at '{dep_path}'", "warning")
-        return
-    with open(dep_path) as file:
-        content: str = file.read()
-    deps: list[tuple[str, str]] = [(line.split()[0].strip(), line.split(maxsplit=1)[1].strip() if len(line.split(maxsplit=1)) > 1 else "latest") for line in content.split("\n") if line.strip() and not line.strip().startswith("//")]
-    if not deps:
-        if log:
-            _print_status("done", "No dependencies needed.", "success")
-        return
-    if log:
-        _print_status("deps", f"Loaded {len(deps)} dependenc{'y' if len(deps) == 1 else 'ies'} from {dep_path}", "info")
-    pending_deps: list[tuple[str, str]] = []
-    scripts_allowed: bool = "allow" if "--allow" in sys.argv else ("skip" if "--skip" in sys.argv else "deny")
-    print_tip: bool = False
-    for pub, rel in deps:
-        dep_key: tuple[str, str] = (parsepub(pub).lower(), rel)
-        if dep_key in installed:
-            continue
-        if pub.lower().startswith("script:"):
-            if scripts_allowed == "allow":
-                _print_status("script", f"Executing script dependency: {pub} {rel}", "info")
-                script_path: str = pub[len("script:"):]
-                if not os.path.isfile(script_path):
-                    _print_status("fail", f"Script file '{script_path}' not found.", "error")
-                    raise SystemExit(1)
-                try:
-                    with open(script_path) as script_file:
-                        script_content: str = script_file.read()
-                    exec(script_content, {"__name__": "__main__"})
-                except Exception:
-                    _print_status("fail", f"Error executing script '{script_path}':\n{traceback.format_exc()}", "error")
-                    raise SystemExit(1)
-            elif scripts_allowed == "skip":
-                _print_status("skip", f"Skipping script dependency: {pub} {rel}", "muted")
-            else:
-                _print_status("deny", f"Script dependency '{pub}' is not allowed. Use '--allow' to allow or '--skip' to skip.", "error")
-                raise SystemExit(1)
-            continue
-        installed.add(dep_key)
-        pending_deps.append((pub, rel))
-    if print_tip:
-        _print_status("deny", "To allow scripts, re-run with '--allow'. To skip scripts, re-run with '--skip'.", "info")
-    tasks: list[asyncio.Task] = [_queue_install(pub, rel, (rel == "latest") or force, install_root, work_dir) for pub, rel in pending_deps]
-    results: list[InstallResult] = await asyncio.gather(*tasks)
-    for result in results:
-        _print_install_result(result, color)
-
-    failures: int = sum(1 for result in results if result.exit_code)
-    if failures:
-        if log:
-            _print_status("fail", f"Dependency install finished with {failures} failure{'s' if failures != 1 else ''}.", "error")
-        raise SystemExit(1)
-
-    for pub, rel in deps:
-        installed_dep_path: str = _dependency_file_path(_publication_dirname(parsepub(pub), rel, install_root))
-        await _getdep_recursive(installed_dep_path, color=color, log=False, visited=visited, installed=installed, install_root=install_root, work_dir=work_dir)
-    if log:
-        _print_status("done", "All dependencies are ready.", "success")
-                
-async def getdep(path: str, color: bool = True, log: bool = True, force: bool = False, install_root: str = "ww", work_dir: str = ".") -> None:
-    await _getdep_recursive(path, color=color, log=log, force=force, install_root=install_root, work_dir=work_dir)
-
-async def getdep_everywhere(path: str, color: bool = True, force: bool = False, install_root: str = "ww", work_dir: str = ".") -> None:
-    dep_files: list[str] = _find_nitrodep_files(path)
-    if not dep_files:
-        _print_status("miss", f"No .nitrodep files found under '{path}'.", "warning")
-        return
-
-    _print_status("deps", f"Found {len(dep_files)} .nitrodep file{'s' if len(dep_files) != 1 else ''} under '{path}'.", "info")
-    visited: set[str] = set()
-    installed: set[tuple[str, str]] = set()
-    for dep_file in dep_files:
-        await _getdep_recursive(dep_file, color=color, log=True, visited=visited, installed=installed, force=force, install_root=install_root, work_dir=work_dir)
-
-async def _install_subdependencies(pub: str, rel: str, color: bool = True, install_root: str = "ww", work_dir: str = ".") -> None:
-    resolved_pub: str = parsepub(pub)
-    dep_path: str = _dependency_file_path(_publication_dirname(resolved_pub, rel, install_root))
-    _print_status("deps", f"Checking sub-dependencies for {resolved_pub.lower()} {rel}", "info")
-    if not os.path.isfile(dep_path):
-        _print_status("info", "No sub-dependencies declared.", "muted")
-        return
-    await getdep(dep_path, color=color, log=True, install_root=install_root, work_dir=work_dir)
-        
-def trust(ext_filename: str, ext_dir_path: str) -> None:
-    ext_path: str = os.path.join(EXTENSIONS_DIR, ext_filename)
-    if not os.path.exists(ext_path):
-        print(f"\033[91mExtension '{ext_filename}' not found and cannot be trusted.")
-        return
-    with open(TRUSTED_EXTENSIONS_FILE) as file:
-        content: str = file.read()
-    if ext_filename not in content:
-        try:
-            if input(f"\033[38;5;208m/!\\ WARNING: You are running this extension for the first time.\n    Make sure to review the contents of\n      \033[0;1;3m{ext_dir_path}\033[0;38;5;208m\n    before running.\n    Trust extension and run command? (y/N) \033[0m").strip().lower() in ["y", "yes", "yeah", "true", "t"]:
-                with open(TRUSTED_EXTENSIONS_FILE, "a") as file:
-                    file.write(f"{ext_filename}\n")
-            else:
-                raise KeyboardInterrupt
-        except (KeyboardInterrupt, EOFError):
-            print("\n\033[91m    Extension not trusted. Aborting.\033[0m")
-            sys.exit(0)
-            
-def load_len() -> None:
-    try:
-        if os.path.exists(LEN_PATH):
-            unload_len()
-        _print_status("sync", "Loading LEN from GitHub...", "info")
-        proc = subprocess.Popen(
-            [
-                "git",
-                "clone",
-                "--progress",
-                "https://github.com/Wednesware/LEN.git",
-                LEN_PATH,
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True
-        )
-
-        for line in proc.stdout:
-            print(_cli(f"  {line.rstrip()}", CLI_DIM))
-        if proc.returncode != 0 and proc.returncode is not None:
-            raise subprocess.CalledProcessError(proc.returncode, proc.args)
-        proc.wait()
-        _print_status("done", "LEN loaded successfully.", "success")
-    except subprocess.CalledProcessError:
-        _print_status("fail", "Could not load LEN from GitHub. Are you sure you have an internet connection?", "error")
-        sys.exit(1)
-        
-def unload_len() -> None:
-    if os.path.exists(LEN_PATH):
-        shutil.rmtree(LEN_PATH)
-        _print_status("done", "LEN unloaded.", "success")
-    else:
-        _print_status("info", "LEN is not loaded.", "muted")
-
-async def build(format: str, source_path: str = ".", output_path: str = "build.%") -> None:
-    _print_status("build", "Preparing build...", "info")
-    try:
-        output_path = output_path.replace("%", {
-            "zip": "zip",
-            "targz": "tar.gz",
-            "n2x": "n2x",
-            "modm": "modm"
-        }[format])
-    except KeyError:
-        _print_status("fail", f"Unknown build format '{format}'.", "error")
-        return
-    if not os.path.isdir(source_path):
-        _print_status("fail", f"Source path '{source_path}' does not exist or is not a directory.", "error")
-        return
-    source_abs: str = os.path.abspath(source_path)
-    output_abs: str = os.path.abspath(output_path)
-    output_dir: str = os.path.dirname(output_abs)
-    if output_dir and not os.path.exists(output_dir):
-        os.makedirs(output_dir, exist_ok=True)
-
-    def should_skip(path: str) -> bool:
-        return os.path.abspath(path) == output_abs
-
-    match format:
-        case "zip":
-            _print_status("build", f"Building project into {output_path}...", "info")
-            with zipfile.ZipFile(output_abs, "w", zipfile.ZIP_DEFLATED) as zipf:
-                for root, dirs, files in os.walk(source_abs):
-                    for file in files:
-                        file_path = os.path.join(root, file)
-                        if should_skip(file_path):
-                            continue
-                        arcname = os.path.relpath(file_path, source_abs)
-                        _print_status("pack", f"Packing {arcname}", "info")
-                        zipf.write(file_path, arcname)
-            _print_status("done", f"Build complete in {output_path}", "success")
-        case "targz":
-            _print_status("build", f"Building project into {output_path}...", "info")
-            with tarfile.open(output_abs, "w:gz") as tar:
-                for root, dirs, files in os.walk(source_abs):
-                    for file in files:
-                        file_path = os.path.join(root, file)
-                        if should_skip(file_path):
-                            continue
-                        arcname = os.path.relpath(file_path, source_abs)
-                        _print_status("pack", f"Packing {arcname}", "info")
-                        tar.add(file_path, arcname=arcname)
-            _print_status("done", f"Build complete in {output_path}", "success")
-        case "n2x":
-            _print_status("build", f"Building project into {output_path}...", "info")
-            required_files = ["ext.py", "README.md", "LICENSE.md", ".nitrodep"]
-            with tarfile.open(output_abs, "w:gz") as tar:
-                for file in required_files:
-                    file_path = os.path.join(source_abs, file)
-                    _print_status("pack", f"Packing {file}", "info")
-                    if not os.path.isfile(file_path):
-                        _print_status("fail", f"Required file for build not found: '{file}'", "error")
-                        return
-                    tar.add(file_path, arcname=file)
-            _print_status("done", f"Build complete in {output_path}", "success")
-        case "modm":
-            _print_status("build", f"Building project into {output_path}...", "info")
-            with tarfile.open(output_abs, "w:gz") as tar:
-                for root, dirs, files in os.walk(source_abs):
-                    for file in files:
-                        file_path = os.path.join(root, file)
-                        if should_skip(file_path):
-                            continue
-                        arcname = os.path.relpath(file_path, source_abs)
-                        _print_status("pack", f"Packing {arcname}", "info")
-                        tar.add(file_path, arcname=arcname)
-            _print_status("done", f"Build complete in {output_path}", "success")
-        case _:
-            _print_status("fail", f"Unknown build format '{format}'.", "error")
 
 async def main() -> None:
     if len(sys.argv) == 1:
@@ -1399,269 +682,216 @@ async def main() -> None:
         print(f"Usage: {COMMAND} <command> [args]")
         print(f"Run {_cli(f'{COMMAND} help', CLI_INFO)} for a full command list.")
         sys.exit(0)
-    if not os.path.exists(EXTENSIONS_DIR):
-        os.makedirs(EXTENSIONS_DIR)
-    if not os.path.exists(TRUSTED_EXTENSIONS_FILE):
-        with open(TRUSTED_EXTENSIONS_FILE, "w") as file:
-            file.write("")
-    
+
     match sys.argv[1]:
         case "get":
             if len(sys.argv) == 2:
                 _print_status("help", f"Usage: {COMMAND} get <publication> [release]", "warning")
                 sys.exit(1)
-            pub: str = sys.argv[2]
-            rel: str = sys.argv[3] if len(sys.argv) > 3 else "latest"
-            result: InstallResult = await install_async(pub, rel)
-            if not result.exit_code:
-                await _install_subdependencies(pub, rel)
-        case "getlib":
-            if len(sys.argv) < 4:
-                _print_status("help", f"Usage: {COMMAND} getlib <project> <publication> [release]", "warning")
-                sys.exit(1)
-            project: str = sys.argv[2]
-            pub = sys.argv[3]
-            rel = sys.argv[4] if len(sys.argv) > 4 else "latest"
-            install_root: str = os.path.join(project, "libraries", "ww")
-            result = await _queue_install_to_root(pub, rel, install_root, True)
-            _print_install_result(result)
-            if result.exit_code:
-                raise SystemExit(result.exit_code)
+            pub = sys.argv[2]
+            rel = sys.argv[3] if len(sys.argv) > 3 else "latest"
+            await install_async(pub, rel, install_root=INTERNAL_PACKAGES_DIR, work_dir=INTERNAL_TEMP_DIR)
         case "rm":
             if len(sys.argv) == 2:
                 _print_status("help", f"Usage: {COMMAND} rm <publication> [release]", "warning")
                 sys.exit(1)
-            pub: str = parsepub(sys.argv[2])
-            _print_status("rm", f"Deleting {pub}", "info")
-            if pub.strip() == "all":
-                if os.path.exists("ww"):
-                    shutil.rmtree("ww")
-                else:
-                    _print_status("info", "No publications installed.", "muted")
-            elif pub in PUBLICATION_CACHE or pub in REVERSE_PUBLICATION_CACHE:
-                if len(sys.argv) > 3:
-                    rel: str = sys.argv[3]
-                    deleted: int = _remove_publication_versions("ww", pub, rel)
-                    if deleted:
-                        _print_status("done", "Operation complete.", "success")
-                    else:
-                        _print_status("miss", f"Release '{rel}' of publication '{pub.capitalize()}' is not installed here. Are you sure you spelled it right?", "warning")
-                else:
-                    deleted: int = _remove_publication_versions("ww", pub)
-                    if deleted:
-                        _print_status("done", "Operation complete.", "success")
-                    else:
-                        _print_status("miss", f"Publication '{pub.capitalize()}' is not installed here. Are you sure you spelled it right?", "warning")
-            else:
-                _print_status("miss", f"Could not find publication '{pub.capitalize()}'. Are you sure you spelled it right?", "warning")
-        case "getdep":
-            path: str = sys.argv[2] if len(sys.argv) > 2 else "."
-            await getdep_everywhere(path)
-        case "forcegetdep":
-            path: str = sys.argv[2] if len(sys.argv) > 2 else "."
-            await getdep_everywhere(path, force=True)
-        case "updlibs":
-            if len(sys.argv) < 3:
-                _print_status("help", f"Usage: {COMMAND} updlibs <project>", "warning")
-                sys.exit(1)
-            await _reinstall_project_libraries(sys.argv[2])
-        case "compat":
-            if len(sys.argv) < 4:
-                _print_status("help", f"Usage: {COMMAND} compat <publication|directory> <mode(abs|rel|rel-up1|rel-up2|rel-up3|abs-ww|rel-ww|rel-libs-ww|custom)> [custom-phrase]", "warning")
-                sys.exit(1)
-            compat_target: str = sys.argv[3]
-            compat_mode: str = sys.argv[2]
-            if compat_mode not in COMPAT_BUILTIN_PREFIXES and compat_mode != "custom":
-                _print_status("help", f"Usage: {COMMAND} compat <publication|directory> <mode(abs|rel|rel-up1|rel-up2|rel-up3|abs-ww|rel-ww|rel-libs-ww|custom)> [custom-phrase]", "warning")
-                sys.exit(1)
-            compat_custom_phrase: str = ""
-            if compat_mode == "custom":
-                if len(sys.argv) < 5:
-                    _print_status("help", f"Usage: {COMMAND} compat <publication|directory> custom <custom-phrase>", "warning")
-                    sys.exit(1)
-                compat_custom_phrase = sys.argv[4]
-
-            compat_dirs: list[str]
-            if "/" in compat_target:
-                compat_dirs = [compat_target]
-            else:
-                compat_pub: str = parsepub(compat_target).lower()
-                compat_symbol: str = REVERSE_PUBLICATION_CACHE.get(compat_pub, compat_pub)
-                compat_prefixes: set[str] = {compat_pub, compat_symbol}
-                compat_dirs = []
-                if os.path.isdir("ww"):
-                    compat_dirs = [
-                        os.path.join("ww", name) for name in os.listdir("ww")
-                        if os.path.isdir(os.path.join("ww", name)) and any(name.lower().startswith(prefix) for prefix in compat_prefixes)
-                    ]
-
-            compat_dirs = [directory for directory in compat_dirs if os.path.exists(directory)]
-            if not compat_dirs:
-                _print_status("miss", f"Could not find any installed directories for '{compat_target}'.", "warning")
-                sys.exit(1)
-
-            compat_total_files: int = 0
-            compat_total_lines: int = 0
-            for compat_dir in compat_dirs:
-                files_changed, lines_changed = _apply_compat(compat_dir, compat_mode, compat_custom_phrase)
-                compat_total_files += files_changed
-                compat_total_lines += lines_changed
-            _print_status("done", f"Updated {compat_total_lines} line{'s' if compat_total_lines != 1 else ''} across {compat_total_files} file{'s' if compat_total_files != 1 else ''}.", "success")
-        case "getinternal":
-            if len(sys.argv) == 2:
-                _print_status("help", "Usage: n2 getinternal <publication> [release]", "warning")
-                sys.exit(1)
-            pub = sys.argv[2]
-            rel = sys.argv[3] if len(sys.argv) > 3 else "latest"
-            result = await install_async(pub, rel, install_root=INTERNAL_WW_DIR, work_dir=INTERNAL_TEMP_DIR)
-            if not result.exit_code:
-                await _install_subdependencies(pub, rel, install_root=INTERNAL_WW_DIR, work_dir=INTERNAL_TEMP_DIR)
-        case "rminternal":
-            if len(sys.argv) == 2:
-                _print_status("help", "Usage: n2 rminternal <publication> [release]", "warning")
-                sys.exit(1)
             pub = parsepub(sys.argv[2])
             _print_status("rm", f"Deleting {pub}", "info")
             if pub.strip() == "all":
-                if os.path.isdir(INTERNAL_WW_DIR):
-                    for entry in os.listdir(INTERNAL_WW_DIR):
-                        if entry in ("len", "temp"):
+                if os.path.isdir(INTERNAL_PACKAGES_DIR):
+                    for entry in os.listdir(INTERNAL_PACKAGES_DIR):
+                        if entry == "temp":
                             continue
-                        entry_path: str = os.path.join(INTERNAL_WW_DIR, entry)
+                        entry_path: str = os.path.join(INTERNAL_PACKAGES_DIR, entry)
                         if os.path.isdir(entry_path):
                             shutil.rmtree(entry_path)
                         else:
                             os.remove(entry_path)
                 else:
                     _print_status("info", "No publications installed.", "muted")
-            elif pub in PUBLICATION_CACHE or pub in REVERSE_PUBLICATION_CACHE:
+            elif pub and pub != "all":
                 if len(sys.argv) > 3:
                     rel = sys.argv[3]
-                    deleted = _remove_publication_versions(INTERNAL_WW_DIR, pub, rel)
+                    deleted = _remove_publication_versions(INTERNAL_PACKAGES_DIR, pub, rel)
                     if deleted:
                         _print_status("done", "Operation complete.", "success")
                     else:
                         _print_status("miss", f"Release '{rel}' of publication '{pub.capitalize()}' is not installed here. Are you sure you spelled it right?", "warning")
                 else:
-                    deleted = _remove_publication_versions(INTERNAL_WW_DIR, pub)
+                    deleted = _remove_publication_versions(INTERNAL_PACKAGES_DIR, pub)
                     if deleted:
                         _print_status("done", "Operation complete.", "success")
                     else:
                         _print_status("miss", f"Publication '{pub.capitalize()}' is not installed here. Are you sure you spelled it right?", "warning")
             else:
                 _print_status("miss", f"Could not find publication '{pub.capitalize()}'. Are you sure you spelled it right?", "warning")
-        case "getdepinternal":
-            path = sys.argv[2] if len(sys.argv) > 2 else "."
-            await getdep_everywhere(path, install_root=INTERNAL_WW_DIR, work_dir=INTERNAL_TEMP_DIR)
-        case "stage":
-            await _handle_stage_command(sys.argv[2:])
-        case "build":
-            if len(sys.argv) == 2:
-                _print_status("help", f"Usage: {COMMAND} build <format(zip|targz|n2x|modm)> [source path] [output path]", "warning")
+        case "list":
+            if not os.path.isdir(INTERNAL_PACKAGES_DIR):
+                _print_status("miss", f"Cache directory '{INTERNAL_PACKAGES_DIR}' does not exist. No publications are installed.", "warning")
                 sys.exit(1)
-            await build(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else ".", sys.argv[4] if len(sys.argv) > 4 else "build.%")
+            _print_status("info", "Installed publications:", "info")
+            for entry in os.listdir(INTERNAL_PACKAGES_DIR):
+                if entry == "temp":
+                    continue
+                entry_path: str = os.path.join(INTERNAL_PACKAGES_DIR, entry)
+                if os.path.isdir(entry_path):
+                    name_split: list[str] = re.match(r'([A-Za-z]*)(.*)', entry).groups()
+                    _print_status("info", f"{PUBLICATION_CACHE.get(name_split[0], 'unknown').capitalize()}{' ' + name_split[1].replace('_', '.') if name_split[1] else ''} ({entry}) at {entry_path}", "info")
+        case "cache":
+            if not os.path.isdir(INTERNAL_PACKAGES_DIR):
+                _print_status("miss", f"Cache directory '{INTERNAL_PACKAGES_DIR}' does not exist yet. There are no cached publications to inspect.", "warning")
+                sys.exit(1)
+            _print_status("hint", f"Trying to list packages in the cache? Use `{COMMAND} list` instead.", "info")
+            def human_size(size: float) -> str:
+                for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+                    if size < 1024:
+                        return f"{size:.2f}{unit}"
+                    size /= 1024
+                return f"{size:.2f}PiB"
+            total_cache_size = sum(f.stat().st_size for f in pathlib.Path(INTERNAL_PACKAGES_DIR).rglob("*") if f.is_file())
+            _print_status("info", f"Total cache size (includes all installed publications): {human_size(total_cache_size)}", "info")
+            sizes: dict = {}
+            for path in pathlib.Path(INTERNAL_PACKAGES_DIR).iterdir():
+                if path.is_dir():
+                    sizes[path] = sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+            total = sum(sizes.values())
+            for path, size in sorted(sizes.items(), key=lambda x: x[1], reverse=True):
+                percent = (size / total * 100) if total else 0
+                _print_status("info", f"{path.name:<30} {human_size(size):>10}  {percent:>6.2f}%", "info")
+            _print_status("hint", f"Use `{COMMAND} rm all` to clear the cache or remove publications one by one with `{COMMAND} rm <publication>`.", "info")
+        case "install":
+            if len(sys.argv) == 2:
+                _print_status("help", f"Usage: {COMMAND} install <publication> [release]", "warning")
+                sys.exit(1)
+            args = sys.argv[2:]
+            target = args[0]
+            release = args[1] if len(args) > 1 and not args[1].startswith("--") else "latest"
+            try:
+                if os.path.isdir(target):
+                    raise ValueError(
+                        "Only cached installer-managed directories may be installed via pipx. "
+                        "Direct local package installs are disabled by default."
+                    )
+                result = install_cached_publication(target, release)
+                _print_status("done", f"Installed publication '{result['command_name']}' via pipx", "success")
+                _print_status("info", f"Source: {result['source_path']}", "info")
+                sys.exit(0)
+            except (FileNotFoundError, ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
+                _print_status("fail", str(exc), "error")
+                sys.exit(1)
+        case "uninstall":
+            if len(sys.argv) == 2:
+                _print_status("help", f"Usage: {COMMAND} uninstall <publication>", "warning")
+                sys.exit(1)
+            command_name = sys.argv[2]
+            try:
+                result = uninstall_target(command_name)
+            except RuntimeError as exc:
+                _print_status("fail", str(exc), "error")
+                sys.exit(1)
+            _print_status("done", f"Removed package '{result['package_name']}' and command '{command_name}' from pipx", "success")
+            sys.exit(0)
         case "readme":
-            if len(sys.argv) == 2:
-                with open(os.path.join(os.path.dirname(__file__), "README.md")) as file:
-                    print(file.read())
-                sys.exit(0)
-            ext_path: str = sys.argv[2] + ".n2x"
-            with zipfile.ZipFile(os.path.join(EXTENSIONS_DIR, ext_path), "r") as zip_ref:
-                zip_ref.extractall(ext_path.replace('.', '-'))
-            with open(os.path.join(ext_path.replace('.', '-'), "README.md")) as file:
+            with open(os.path.join(os.path.dirname(__file__), "README.md")) as file:
                 print(file.read())
+            sys.exit(0)
         case "license":
-            if len(sys.argv) == 2:
-                with open(os.path.join(os.path.dirname(__file__), "LICENSE.md")) as file:
-                    print(file.read())
-                sys.exit(0)
-            ext_path: str = sys.argv[2] + ".n2x"
-            with zipfile.ZipFile(os.path.join(EXTENSIONS_DIR, ext_path), "r") as zip_ref:
-                zip_ref.extractall(ext_path.replace('.', '-'))
-            with open(os.path.join(ext_path.replace('.', '-'), "LICENSE.md")) as file:
+            with open(os.path.join(os.path.dirname(__file__), "LICENSE.md")) as file:
                 print(file.read())
-        case "trust-ext":
-            if len(sys.argv) == 2:
-                _print_status("help", f"Usage: {COMMAND} trust-ext <extension>", "warning")
-                sys.exit(1)
-            ext_filename: str = sys.argv[2] + ".n2x"
-            ext_path: str = os.path.join(EXTENSIONS_DIR, ext_filename)
-            ext_dir_path: str = ext_path.replace('.', '-')
-            trust(ext_filename, ext_dir_path)
-        case "untrust-ext":
-            if len(sys.argv) == 2:
-                _print_status("help", f"Usage: {COMMAND} untrust-ext <extension>", "warning")
-                sys.exit(1)
-            ext_filename: str = sys.argv[2] + ".n2x"
-            with open(TRUSTED_EXTENSIONS_FILE) as file:
-                content: str = file.read()
-            with open(TRUSTED_EXTENSIONS_FILE, "w") as file:
-                file.write("\n".join([line for line in content.split("\n") if line.strip() != ext_filename]))
-        case "list-ext":
-            _print_installed_extensions()
-        case "load-len":
-            load_len()
-        case "unload-len":
-            unload_len()
-        case "install-ext":
-            if len(sys.argv) == 2:
-                _print_status("help", f"Usage: {COMMAND} install-ext <extension>", "warning")
-                sys.exit(1)
-            load_len()
-            install_ext_filename: str = sys.argv[2] if sys.argv[2].endswith(".n2x") else sys.argv[2] + ".n2x"
-            if os.path.exists(os.path.join(LEN_PATH, install_ext_filename)):
-                shutil.copy(os.path.join(LEN_PATH, install_ext_filename), EXTENSIONS_DIR)
-                _print_status("done", f"Extension '{sys.argv[2]}' installed successfully.", "success")
-            else:
-                _print_status("miss", f"Extension '{sys.argv[2]}' not found in the LEN repository.", "warning")
-        case "uninstall-ext":
-            if len(sys.argv) == 2:
-                _print_status("help", f"Usage: {COMMAND} uninstall-ext <extension>", "warning")
-                sys.exit(1)
-            ext_filename: str = sys.argv[2] + ".n2x" if not sys.argv[2].endswith(".n2x") else sys.argv[2]
-            ext_path: str = os.path.join(EXTENSIONS_DIR, ext_filename)
-            if os.path.exists(ext_path):
-                os.remove(ext_path)
-                _print_status("done", f"Extension '{sys.argv[2]}' uninstalled successfully.", "success")
-            else:
-                _print_status("miss", f"Extension '{sys.argv[2]}' not installed.", "warning")
-        case "list-len":
-            load_len()
-            _print_len_extensions()
+            sys.exit(0)
         case "help":
             _print_help()
-            print()
-            _print_extension_commands()
         case _:
-            for ext_filename2 in [item for item in os.listdir(EXTENSIONS_DIR) if item.endswith(".n2x") or item.endswith(".n2xp")]:
-                ext_path2: str = os.path.join(EXTENSIONS_DIR, ext_filename2)
-                for ext_filename in [item for item in os.listdir(ext_path2) if item.endswith(".n2x")] if ext_filename2.endswith(".n2xp") else [ext_filename2]:
-                    try:
-                        if sys.argv[1] == ext_filename.removesuffix(".n2x"):
-                            ext_path: str = os.path.join(EXTENSIONS_DIR, ext_filename)
-                            ext_dir_path: str = ext_path.replace('.', '-')
-                            with tarfile.open(ext_path, "r:gz") as tar:
-                                tar.extractall(ext_dir_path)
-                            trust(ext_filename, ext_dir_path)
-                            script_path: str = os.path.join(ext_dir_path, "ext.py")
-                            nitrodep_path: str = os.path.join(ext_dir_path, ".nitrodep")
-                            if os.path.exists(nitrodep_path):
-                                print("\033[94m", end="", flush=True)
-                                await getdep(nitrodep_path, log=False)
-                                print("\033[0m", end="", flush=True)
-                            subprocess.run(["python", script_path, *sys.argv[2:]])
-                            if os.path.exists(ext_dir_path):
-                                shutil.rmtree(ext_dir_path)
-                            if os.path.exists("ww"):
-                                shutil.rmtree("ww")
-                            return
-                    except Exception:
-                        for line in traceback.format_exc().split("\n"):
-                            if line.strip():
-                                print(_cli(f"  {line}", CLI_ERROR))
             _print_status("miss", f"Unknown command: {sys.argv[1]}", "warning")
             print(f"Run {_cli(f'{COMMAND} help', CLI_INFO)} for a list of commands.")
-            
+async def require_async(pub: str, rel: str | None = None) -> object:
+    pub_name, submodule = [pub, None] if len(pub.split(".", 1)) == 1 else pub.split(".", 1)
+    pub = parsepub(pub_name)
+    rel = rel or "latest"
+    cache_dir = os.path.join(INTERNAL_PACKAGES_DIR, _publication_leaf(pub, rel))
+
+    if not os.path.isdir(cache_dir):
+        try:
+            result: InstallResult = await install_async(pub, rel, reinstall=False, install_root=INTERNAL_PACKAGES_DIR, work_dir=INTERNAL_TEMP_DIR, emit=False, error=True)
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError, TimeoutError, ConnectionError) as exc:
+            raise SourcegenDependencyError(
+                f"Could not install '{pub}' release '{rel}' because the site is unreachable or offline. "
+                "Install it once online or make sure the package is already cached locally."
+            ) from exc
+        if result.exit_code:
+            lines = " ".join(result.lines)
+            raise SourcegenDependencyError(
+                f"Could not install '{pub}' release '{rel}' because the dependency is unavailable or the site is unreachable: {lines}"
+            )
+
+    name: str = _publication_leaf(pub, rel)
+    module_path = os.path.join(cache_dir, f"{submodule.replace('.', os.sep)}.py" if submodule else "__init__.py")
+    if not os.path.exists(module_path):
+        if submodule is None:
+            raise ModuleNotFoundError(f"No package entry point found in publication '{pub}' release '{rel}'")
+        raise ModuleNotFoundError(f"No such submodule: '{submodule}' in publication '{pub}' release '{rel}'")
+
+    module_name = f"{name}.{submodule}" if submodule else name
+
+    package_spec = importlib.util.spec_from_file_location(
+        name,
+        os.path.join(cache_dir, "__init__.py"),
+        submodule_search_locations=[cache_dir],
+    )
+
+    if package_spec is None or package_spec.loader is None:
+        raise ModuleNotFoundError(
+            f"Could not load publication '{pub}' release '{rel}'"
+        )
+
+    package = importlib.util.module_from_spec(package_spec)
+    sys.modules[name] = package
+
+    try:
+        package_spec.loader.exec_module(package)
+    except FileNotFoundError as exc:
+        raise ModuleNotFoundError(
+            f"No package entry point found in publication '{pub}' release '{rel}'"
+        ) from exc
+
+    if submodule is None:
+        return package
+
+    return importlib.import_module(module_name)
+
+def _run_coroutine_from_sync(coro):
+    result: dict[str, object] = {}
+    error: dict[str, BaseException] = {}
+
+    def runner() -> None:
+        try:
+            result["value"] = asyncio.run(coro)
+        except BaseException as exc:  # pragma: no cover - exercised via tests
+            error["value"] = exc
+
+    thread = threading.Thread(target=runner, daemon=True)
+    thread.start()
+    thread.join()
+    
+    if "value" in error:
+        raise error["value"]
+    return result["value"]
+
+def require(pub: str, rel: str | None = None) -> object:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(require_async(pub, rel))
+    return _run_coroutine_from_sync(require_async(pub, rel))
+
+def cleanup() -> None:
+    if os.path.exists(INTERNAL_TEMP_DIR):
+        shutil.rmtree(INTERNAL_TEMP_DIR)
+        os.mkdir(INTERNAL_TEMP_DIR)
+    if os.path.exists(INTERNAL_PACKAGES_DIR):
+        shutil.rmtree(INTERNAL_PACKAGES_DIR)
+        os.mkdir(INTERNAL_PACKAGES_DIR)
+        
 def entrypoint() -> None:
     asyncio.run(main())
     
